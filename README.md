@@ -5,6 +5,38 @@ Robinhood account via [`robin_stocks`](https://github.com/jmfernandes/robin_stoc
 Everything runs on your machine — your credentials go straight to Robinhood
 and are never sent anywhere else.
 
+This is personal-use software that connects to **your own** brokerage
+account — it's not a hosted product or a multi-tenant service, and it isn't
+meant to run against anyone else's account or be exposed beyond `localhost`
+(see Notes/limitations below).
+
+## What this demonstrates
+
+A few things this codebase is meant to show, for anyone skimming it:
+
+- **Options pricing & Greeks from scratch** — Black-Scholes, an American
+  binomial tree, Brent's-method implied vol solving, all independently
+  verified against known textbook values and put-call parity
+  (`risk_tool/pricing.py`, `risk_tool/greeks.py`).
+- **Real risk management, not just signals** — Kelly-criterion sizing with a
+  hard cap that always wins regardless of what Kelly suggests
+  (`risk_tool/sizing.py`), pre-committed exit rules evaluated live against
+  open positions (`risk_tool/risk_manager.py`), and portfolio-level delta/vega
+  governors that can halt new entries.
+- **Statistics applied correctly, not just called** — GARCH/EGARCH vol
+  forecasting fit by maximum likelihood (`risk_tool/realized_vol.py`), and a
+  beta-hedge calculator (`risk_tool/hedge.py`) that separates price-level
+  correlation (inflated by shared trend) from return correlation (the honest
+  co-movement signal), sized off delta-adjusted exposure rather than notional.
+- **Test discipline** — the entire `risk_tool/` package is pure, dependency-injected,
+  and independently pytest-covered (122 passing cases: `pytest tests/ -v`) —
+  it's also usable as a standalone CLI with no Streamlit/Robinhood dependency
+  at all (`python3 -m risk_tool.cli --help`).
+- **Production-adjacent app structure** — Robinhood I/O is fully isolated from
+  presentation (`app/data_fetch.py` returns plain DataFrames, `dashboard.py` is
+  UI-only), so the business logic is testable without a live session or network
+  access.
+
 ## What it shows
 
 - **Overview** — equity, cash, buying power, day P&L, portfolio value over time.
@@ -13,12 +45,20 @@ and are never sent anywhere else.
 - **Vol Exposure** — book-level net delta/theta/vega/gamma, vega & theta
   broken down by underlying, and your VIX-ETP holdings (VXX/UVXY/SVXY/etc.,
   configurable) with live quotes.
+- **Vol Skew** — live IV-by-strike and bid/ask-spread-by-strike for any
+  underlying/expiration, with your held contracts marked on both charts.
 - **Risk Tool** — strike selection by expected value, Kelly-based position
   sizing with a non-overridable hard cap, pre-committed entry/exit levels,
   and a live monitor that runs exit rules against your actual open
   positions. Does not predict direction — see `risk_tool/README.md` for the
   full model-by-model writeup (math, assumptions, limitations). Also usable
   standalone: `python3 -m risk_tool.cli --help`.
+- **Correlation Explorer** — cumulative-return chart and price-level/return
+  correlation for any two symbols you type in.
+- **Hedge Calculator** — sizes a beta-hedge (shares or futures) for a shares
+  or options position against any correlated instrument, with beta estimated
+  live from price history, plus a movable P&L scenario chart (drag to any
+  bearish or bullish move) for the resulting hedged position.
 - **Orders & History** — open orders and recent fills.
 - **Win Rate** — realized round-trip trades FIFO-matched from your fill history, with win rate, avg
   win/loss, profit factor, a cumulative realized-P&L chart, and a breakdown by equity vs. options.
@@ -74,11 +114,11 @@ This opens the dashboard in your browser at `http://localhost:8501`.
 dashboard.py           Streamlit entrypoint / UI
 app/auth.py            Robinhood login (+ MFA) handling
 app/data_fetch.py      All robin_stocks calls, returned as plain DataFrames
-app/vol_analysis.py    Greeks aggregation, vega/theta by underlying, expiry checks
+app/vol_analysis.py    Greeks aggregation, vega/theta by underlying, expiry checks, cross-symbol correlation
 app/journal.py         Trade journal normalization + CSV export
 app/performance.py     FIFO round-trip trade matching + win-rate stats
 app/colors.py          Shared chart color tokens
-risk_tool/             Pricing, Greeks, strike selection, sizing, exit rules — see risk_tool/README.md
+risk_tool/             Pricing, Greeks, strike selection, sizing, exit rules, beta-hedge sizing — see risk_tool/README.md
 tests/                 pytest suite for risk_tool (run: pytest tests/ -v)
 exports/               CSV journal exports land here (gitignored)
 ```
