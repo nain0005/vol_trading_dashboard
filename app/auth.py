@@ -15,6 +15,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def is_demo_mode() -> bool:
+    return os.getenv("DEMO_MODE", "false").strip().lower() == "true"
+
+
 class LoginError(RuntimeError):
     pass
 
@@ -69,7 +73,13 @@ def logout() -> None:
 
 
 def ensure_logged_in() -> bool:
-    """Streamlit-friendly login gate. Returns True once authenticated."""
+    """Streamlit-friendly login gate. Returns True once authenticated.
+
+    In DEMO_MODE there's no Robinhood account behind this at all — skip the
+    gate entirely so a public deployment never prompts for (or needs) real
+    credentials."""
+    if is_demo_mode():
+        return True
     if st.session_state.get("rh_logged_in"):
         return True
 

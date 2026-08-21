@@ -85,6 +85,25 @@ streamlit run dashboard.py
 
 This opens the dashboard in your browser at `http://localhost:8501`.
 
+### Demo mode (no Robinhood account required)
+
+```bash
+DEMO_MODE=true streamlit run dashboard.py
+```
+
+Runs the exact same UI on synthetic data (`app/demo_data.py`) — no Robinhood
+credentials, no login screen, no real account anywhere in the loop. Prices,
+positions, and history are generated deterministically (seeded per symbol),
+but option prices/Greeks are computed with the real `risk_tool` Black-Scholes
+engine, so that part is genuinely the same math the live version uses.
+
+This is what a **public deployment** should run — e.g. on
+[Streamlit Community Cloud](https://share.streamlit.io): point it at this
+repo, set the main file to `dashboard.py`, and add `DEMO_MODE = "true"` under
+the app's Secrets (not `.env` — that file never leaves your machine and isn't
+part of the repo). Never deploy this app publicly connected to a real
+Robinhood account — see Notes/limitations below for why.
+
 ### Login & 2FA
 
 - If Robinhood challenges you for an SMS/app code on first login, the app
