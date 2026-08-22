@@ -16,7 +16,16 @@ load_dotenv()
 
 
 def is_demo_mode() -> bool:
-    return os.getenv("DEMO_MODE", "false").strip().lower() == "true"
+    """True if DEMO_MODE is set, via either a local .env (os.environ, loaded
+    above) or Streamlit Community Cloud's Secrets UI (st.secrets — Cloud does
+    NOT reliably mirror secrets into os.environ, so os.getenv alone isn't
+    enough there)."""
+    if os.getenv("DEMO_MODE", "").strip().lower() == "true":
+        return True
+    try:
+        return str(st.secrets.get("DEMO_MODE", "")).strip().lower() == "true"
+    except Exception:
+        return False
 
 
 class LoginError(RuntimeError):
