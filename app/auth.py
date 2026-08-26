@@ -6,13 +6,18 @@ days you won't be prompted for MFA again. We still support a TOTP secret in
 .env for fully unattended re-auth (e.g. after the cached session expires).
 """
 import os
+from pathlib import Path
 
 import pyotp
 import robin_stocks.robinhood as rh
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()
+# Anchored to the repo root regardless of the current working directory the
+# app happens to be launched from — load_dotenv() with no path only finds
+# .env if CWD is inside (or below) the project folder, which silently breaks
+# credential loading if you run `streamlit run` from anywhere else.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 def is_demo_mode() -> bool:
