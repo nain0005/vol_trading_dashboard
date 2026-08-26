@@ -9,6 +9,7 @@ import streamlit as st
 from app import colors, journal, performance, vol_analysis
 from app.auth import ensure_logged_in, is_demo_mode, logout
 from risk_tool import hedge
+from risk_tool import option_strategy
 from risk_tool import realized_vol as rv
 from risk_tool import risk_manager
 from risk_tool import sizing as risk_sizing
@@ -973,6 +974,126 @@ def render_hedge_scenario(calc: dict):
     )
 
 
+def render_strategy_payoff(d: dict):
+    st.subheader("Multi-leg option strategy payoff")
+    st.caption(
+        "Max profit, max loss, and breakeven(s) for any combination of calls/puts on one underlying, "
+        "at expiration — exact values, derived from the payoff's piecewise-linear shape rather than a "
+        "numeric approximation. Works for any spread (bull call, bear put, straddle, etc.), not just one strategy."
+    )
+
+    opt = d["option_positions"]
+    combo_labels = ["Manual entry"]
+    combo_lookup = {}
+    if not opt.empty:
+        for (symbol, expiration), group in opt.groupby(["symbol", "expiration"]):
+            if len(group) >= 2:
+                label = f"{symbol} exp {expiration} ({len(group)} legs)"
+                combo_labels.append(label)
+                combo_lookup[label] = group
+
+    chosen = st.selectbox("Prefill from an open multi-leg position (optional)", combo_labels)
+    prefill_group = combo_lookup.get(chosen)
+
+    with st.form("strategy_payoff_inputs"):
+        default_symbol = prefill_group.iloc[0]["symbol"] if prefill_group is not None else ""
+        underlying_symbol = st.text_input("Underlying symbol (centers the chart's price range)", value=default_symbol).strip().upper()
+
+        default_n_legs = len(prefill_group) if prefill_group is not None else 2
+        n_legs = st.number_input("Number of legs", min_value=1, max_value=4, value=default_n_legs, step=1)
+
+        leg_inputs = []
+        for i in range(int(n_legs)):
+            st.markdown(f"###### Leg {i + 1}")
+            if prefill_group is not None and i < len(prefill_group):
+                row = prefill_group.iloc[i]
+                d_side = "Long" if row["side"] == "long" else "Short"
+                d_type = row["type"].capitalize()
+                d_strike = float(row["strike"])
+                d_premium = abs(float(row["avg_price"]))
+                d_contracts = abs(float(row["quantity"]))
+            else:
+                d_side, d_type, d_strike, d_premium, d_contracts = "Long", "Call", 0.0, 0.0, 1.0
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            side = c1.selectbox("Side", ["Long", "Short"], index=0 if d_side == "Long" else 1, key=f"leg_side_{i}")
+            opt_type = c2.selectbox("Type", ["Call", "Put"], index=0 if d_type == "Call" else 1, key=f"leg_type_{i}")
+            strike = c3.number_input("Strike ($)", min_value=0.0, value=d_strike, step=0.5, key=f"leg_strike_{i}")
+            premium = c4.number_input("Premium ($/share)", min_value=0.0, value=d_premium, step=0.01, key=f"leg_premium_{i}")
+            contracts = c5.number_input("Contracts", min_value=1.0, value=d_contracts, step=1.0, key=f"leg_contracts_{i}")
+            leg_inputs.append((side, opt_type, strike, premium, contracts))
+
+        submitted = st.form_submit_button("Analyze", type="primary")
+
+    if not submitted:
+        st.info("Set up your legs above (or pick an open position to prefill) and click Analyze.")
+        return
+
+    legs = [
+        option_strategy.OptionLeg(
+            option_type=opt_type.lower(), strike=strike, premium=premium,
+            contracts=contracts if side == "Long" else -contracts,
+        )
+        for side, opt_type, strike, premium, contracts in leg_inputs
+        if strike > 0
+    ]
+    if not legs:
+        st.error("Enter at least one leg with a strike > 0.")
+        return
+
+    profile = option_strategy.analyze_strategy(legs)
+
+    st.markdown("##### Strategy summary")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Max profit", money(profile.max_profit) if profile.max_profit is not None else "Unlimited")
+    c2.metric("Max loss", money(profile.max_loss) if profile.max_loss is not None else "Unlimited")
+    debit_label = "paid" if profile.net_debit >= 0 else "received"
+    c3.metric("Net debit / credit", f"{money(abs(profile.net_debit))} ({debit_label})")
+    c4.metric("Breakeven(s)", ", ".join(f"${b:,.2f}" for b in profile.breakevens) if profile.breakevens else "—")
+
+    spot = None
+    if underlying_symbol:
+        try:
+            spot = data_fetch.get_stock_quote(underlying_symbol)["mark"]
+        except Exception:
+            spot = None
+
+    strikes = [leg.strike for leg in legs]
+    low_strike, high_strike = min(strikes), max(strikes)
+    center = spot if spot else (low_strike + high_strike) / 2
+    pad = max(high_strike - low_strike, center * 0.15, 5.0)
+    x_min = max(0.0, min(low_strike, center) - pad)
+    x_max = max(high_strike, center) + pad
+
+    n_points = 200
+    xs = [x_min + i * (x_max - x_min) / (n_points - 1) for i in range(n_points)]
+    ys = [option_strategy.strategy_pl(legs, x) for x in xs]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color=colors.CATEGORICAL[0], width=2.5), name="P&L at expiration"))
+    fig.add_hline(y=0, line=dict(color=colors.INK_MUTED, dash="dash", width=1))
+    for be in profile.breakevens:
+        if x_min <= be <= x_max:
+            fig.add_vline(x=be, line=dict(color=colors.STATUS_WARNING, dash="dot", width=1), annotation_text=f"BE ${be:,.2f}", annotation_position="top")
+    if spot and x_min <= spot <= x_max:
+        fig.add_vline(x=spot, line=dict(color=colors.INK_MUTED, dash="dash", width=1), annotation_text="Spot", annotation_position="bottom")
+    fig.update_layout(
+        height=380,
+        margin=dict(l=10, r=10, t=20, b=10),
+        plot_bgcolor=colors.SURFACE,
+        paper_bgcolor=colors.SURFACE,
+        xaxis=dict(title="Underlying price at expiration ($)", showgrid=False, color=colors.INK_MUTED),
+        yaxis=dict(title="P&L ($)", showgrid=True, gridcolor=colors.GRIDLINE, zerolinecolor=colors.INK_MUTED, color=colors.INK_MUTED, tickprefix="$"),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "P&L at expiration (intrinsic value only, no remaining time value) — the standard payoff-diagram convention. "
+        "\"Unlimited\" means the payoff keeps moving in that direction indefinitely past the highest strike "
+        "(e.g. an uncovered long or short call), not a very large but finite number."
+    )
+
+
 def render_orders(d: dict):
     st.subheader("Open orders")
     open_orders = d["open_orders"]
@@ -1122,7 +1243,8 @@ def main():
     tabs = st.tabs(
         [
             "Overview", "Positions & Greeks", "Vol Exposure", "Vol Skew", "Risk Tool",
-            "Correlation Explorer", "Hedge Calculator", "Orders & History", "Win Rate", "Journal / Export",
+            "Correlation Explorer", "Hedge Calculator", "Strategy Payoff",
+            "Orders & History", "Win Rate", "Journal / Export",
         ]
     )
     with tabs[0]:
@@ -1142,10 +1264,12 @@ def main():
     with tabs[6]:
         render_hedge_calculator(d)
     with tabs[7]:
-        render_orders(d)
+        render_strategy_payoff(d)
     with tabs[8]:
-        render_win_rate(d)
+        render_orders(d)
     with tabs[9]:
+        render_win_rate(d)
+    with tabs[10]:
         render_journal(d)
 
 
