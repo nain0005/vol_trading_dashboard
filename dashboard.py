@@ -1,25 +1,16 @@
-"""Personal vol-trading dashboard — Robinhood options + VIX-ETP book.
 
-Run with: streamlit run dashboard.py
-"""
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from app import colors, journal, performance, vol_analysis
-from app.auth import ensure_logged_in, is_demo_mode, logout
-from risk_tool import hedge
+from app import colors, data_fetch, journal, performance, vol_analysis
+from app.auth import ensure_logged_in, logout
 from risk_tool import option_strategy
 from risk_tool import realized_vol as rv
 from risk_tool import risk_manager
 from risk_tool import sizing as risk_sizing
 from risk_tool import strike_selection
 from risk_tool.config import DEFAULT_CONFIG, RiskConfig
-
-if is_demo_mode():
-    from app import demo_data as data_fetch  # same function names/shapes as data_fetch — synthetic, no live account
-else:
-    from app import data_fetch
 
 st.set_page_config(page_title="Vol Trading Dashboard", page_icon="📉", layout="wide")
 
@@ -561,15 +552,6 @@ def render_position_monitor(d: dict):
 
         dte = int(pos["dte"]) if pd.notna(pos["dte"]) else 999
         per_contract_delta = pos["delta"] / (pos["quantity"] * 100) if pos["quantity"] else 0.0
-        label = f"{pos['symbol']} ${pos['strike']:.2f} {pos['type']} exp {pos['expiration']} ({pos['side']} x{pos['quantity']:.0f})"
-
-        if pos["avg_price"] <= 0:
-            # Robinhood reports average_price as 0/missing for some positions
-            # (assignment, exercise, older fills) — the exit rules need a real
-            # entry premium to compute %P&L against, so skip evaluating this
-            # one instead of crashing the whole tab.
-            st.warning(f"**{label}** — skipped: Robinhood reports no entry price (avg_price=${pos['avg_price']:.2f}) for this position, so %P&L-based exit rules can't be evaluated.")
-            continue
 
         position = risk_manager.Position(
             symbol=pos["symbol"],
@@ -587,6 +569,7 @@ def render_position_monitor(d: dict):
         signals = risk_manager.evaluate_all_rules(position, config)
         triggered = [s for s in signals if s.triggered]
 
+        label = f"{pos['symbol']} ${pos['strike']:.2f} {pos['type']} exp {pos['expiration']} ({pos['side']} x{pos['quantity']:.0f})"
         if triggered:
             st.error(f"**{label}** — {len(triggered)} exit rule(s) triggered")
             for s in triggered:
@@ -638,418 +621,32 @@ def render_position_monitor(d: dict):
         st.success("No portfolio governors triggered — new entries not halted.")
 
 
-def render_correlation_explorer(d: dict):
-    st.subheader("Correlation explorer")
-    st.caption(
-        "Cumulative return and correlation for any two symbols — not just what's in your book. "
-        "Price-level correlation is usually inflated by shared trend; daily-return correlation is "
-        "the cleaner day-to-day co-movement signal."
-    )
-
-    with st.form("correlation_explorer_inputs"):
-        c1, c2 = st.columns(2)
-        symbol_a = c1.text_input("Symbol A", value="XOM").strip().upper()
-        symbol_b = c2.text_input("Symbol B", value="USO").strip().upper()
-        submitted = st.form_submit_button("Compare", type="primary")
-
-    if not submitted:
-        st.info("Enter two symbols and click Compare.")
-        return
-    if not symbol_a or not symbol_b:
-        st.error("Enter both symbols.")
-        return
-
-    try:
-        hist_a = fetch_price_history(symbol_a)
-        hist_b = fetch_price_history(symbol_b)
-    except Exception as exc:
-        st.error(f"Couldn't load price history ({exc}).")
-        return
-    if hist_a.empty or hist_b.empty:
-        st.warning(f"No price history returned for {symbol_a if hist_a.empty else symbol_b}.")
-        return
-
-    stats = vol_analysis.correlation_stats(hist_a, hist_b)
-    if stats["price_corr"] is None:
-        st.warning("Not enough overlapping trading days to compute correlation.")
-        return
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Price-level correlation", f"{stats['price_corr']:.2f}")
-    c2.metric("Daily-return correlation", f"{stats['return_corr']:.2f}")
-    c3.metric("Overlapping trading days", f"{stats['n_obs']}")
-
-    merged = pd.merge(hist_a[["date", "close"]], hist_b[["date", "close"]], on="date", suffixes=("_a", "_b"))
-    cum_a = vol_analysis.cumulative_return(merged["close_a"])
-    cum_b = vol_analysis.cumulative_return(merged["close_b"])
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=merged["date"], y=cum_a, mode="lines", name=symbol_a,
-            line=dict(color=colors.CATEGORICAL[0], width=2),
-            hovertemplate="%{x|%b %d}<br>" + symbol_a + " %{y:+.1f}%<extra></extra>",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=merged["date"], y=cum_b, mode="lines", name=symbol_b,
-            line=dict(color=colors.CATEGORICAL[7], width=2),
-            hovertemplate="%{x|%b %d}<br>" + symbol_b + " %{y:+.1f}%<extra></extra>",
-        )
-    )
-    fig.add_hline(y=0, line=dict(color=colors.INK_MUTED, dash="dash", width=1))
-    fig.update_layout(
-        height=340,
-        margin=dict(l=10, r=10, t=10, b=10),
-        plot_bgcolor=colors.SURFACE,
-        paper_bgcolor=colors.SURFACE,
-        xaxis=dict(showgrid=False, color=colors.INK_MUTED),
-        yaxis=dict(showgrid=True, gridcolor=colors.GRIDLINE, zerolinecolor=colors.INK_MUTED, color=colors.INK_MUTED, ticksuffix="%"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"Cumulative return indexed to 0% at {merged['date'].iloc[0]:%Y-%m-%d} · daily bars, 1yr lookback.")
-
-
-def render_hedge_calculator(d: dict):
-    st.subheader("Beta-hedge sizing")
-    st.caption(
-        "Sizes an offsetting position in a correlated hedge instrument (an ETF, or futures via its "
-        "contract multiplier), using delta-adjusted exposure — not premium or notional. This offsets "
-        "only the portion of the position's move that correlates with the hedge instrument (R², below) "
-        "— not theta, vega, or the idiosyncratic move you're actually betting on. It doesn't make a "
-        "trade 'must profit'; it isolates the bet from the hedge instrument's direction. Works for any "
-        "two symbols — not just what's in your book."
-    )
-
-    held_options = d["option_positions"]
-    held_equity = d["equity_positions"]
-    position_labels = ["Manual entry"]
-    position_lookup = {}
-    for _, pos in held_options.iterrows():
-        label = f"{pos['symbol']} ${pos['strike']:.2f} {pos['type']} exp {pos['expiration']} ({pos['side']} x{pos['quantity']:.0f})"
-        position_labels.append(label)
-        position_lookup[label] = ("option", pos)
-    for _, pos in held_equity.iterrows():
-        label = f"{pos['symbol']} — {pos['quantity']:.0f} shares"
-        position_labels.append(label)
-        position_lookup[label] = ("equity", pos)
-
-    chosen_label = st.selectbox("Prefill from an open position (optional)", position_labels)
-    prefill = position_lookup.get(chosen_label)
-
-    with st.form("hedge_calc_inputs"):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("###### Position")
-            if prefill and prefill[0] == "option":
-                pos = prefill[1]
-                pos_type = st.selectbox("Position type", ["Option", "Shares"], index=0)
-            elif prefill and prefill[0] == "equity":
-                pos = prefill[1]
-                pos_type = st.selectbox("Position type", ["Shares", "Option"], index=0)
-            else:
-                pos = None
-                pos_type = st.selectbox("Position type", ["Shares", "Option"], index=0)
-
-            if pos_type == "Shares":
-                default_symbol = pos["symbol"] if prefill and prefill[0] == "equity" else ""
-                default_qty = abs(float(pos["quantity"])) if prefill and prefill[0] == "equity" else 100.0
-                default_dir = "Long" if (prefill and prefill[0] == "equity" and pos["quantity"] > 0) else "Short"
-                underlying_symbol = st.text_input("Underlying symbol", value=default_symbol).strip().upper()
-                share_dir = st.selectbox("Direction", ["Short", "Long"], index=0 if default_dir == "Short" else 1)
-                share_qty = st.number_input("Shares", min_value=0.0, value=default_qty, step=1.0)
-                share_entry_price = st.number_input("Entry price ($, 0 = use current price)", min_value=0.0, value=0.0, step=0.5)
-                opt_delta = opt_contracts = opt_mult = opt_side = opt_strike = opt_premium = None
-            else:
-                default_symbol = pos["symbol"] if prefill and prefill[0] == "option" else ""
-                # pos["delta"] from data_fetch is already position-level (delta * signed_qty * 100) — back out per-contract.
-                if prefill and prefill[0] == "option" and pos["quantity"]:
-                    default_delta = float(pos["delta"]) / (float(pos["quantity"]) * 100.0)
-                    default_delta = abs(default_delta) if pos["side"] == "long" else -abs(default_delta)
-                else:
-                    default_delta = -0.46
-                default_contracts = abs(float(pos["quantity"])) if prefill and prefill[0] == "option" else 5.0
-                default_side = pos["type"].capitalize() if prefill and prefill[0] == "option" else "Put"
-                default_strike = float(pos["strike"]) if prefill and prefill[0] == "option" else 0.0
-                default_premium = float(pos["avg_price"]) if prefill and prefill[0] == "option" else 0.0
-
-                underlying_symbol = st.text_input("Underlying symbol", value=default_symbol).strip().upper()
-                opt_side = st.selectbox("Call or put", ["Put", "Call"], index=0 if default_side == "Put" else 1)
-                opt_delta = st.number_input("Delta (signed, from your broker)", value=float(default_delta), step=0.01, format="%.4f")
-                opt_contracts = st.number_input("Contracts", min_value=0.0, value=default_contracts, step=1.0)
-                opt_mult = st.number_input("Shares per contract", min_value=1.0, value=100.0, step=1.0)
-                opt_strike = st.number_input("Strike ($, for the scenario chart)", min_value=0.0, value=default_strike, step=0.5)
-                opt_premium = st.number_input("Entry premium ($/contract, for the scenario chart)", min_value=0.0, value=default_premium, step=0.01)
-                share_dir = share_qty = share_entry_price = None
-
-            underlying_price_input = st.number_input("Underlying price ($, 0 = auto-fetch)", min_value=0.0, value=0.0, step=0.5)
-
-        with c2:
-            st.markdown("###### Hedge instrument")
-            hedge_symbol = st.text_input("Hedge symbol (ETF, for beta estimation)", value="USO").strip().upper()
-            hedge_price_input = st.number_input("Hedge price per unit ($, 0 = auto-fetch)", min_value=0.0, value=0.0, step=0.5)
-            hedge_mult = st.number_input(
-                "Units per contract (1 = ETF/stock shares; barrels/contract for futures — 1000 CL, 100 MCL)",
-                min_value=1.0, value=1.0, step=1.0,
-            )
-            beta_mode = st.radio("Beta", ["Estimate from price history", "Enter manually"], horizontal=True)
-            if beta_mode == "Enter manually":
-                beta_manual = st.number_input("Beta", value=0.35, step=0.01, format="%.4f")
-                lookback_days = None
-            else:
-                beta_manual = None
-                lookback_days = st.number_input("Lookback (calendar days)", min_value=10, value=90, step=10)
-
-        submitted = st.form_submit_button("Calculate", type="primary")
-
-    if submitted:
-        if not underlying_symbol or not hedge_symbol:
-            st.error("Enter both an underlying symbol and a hedge symbol.")
-            return
-
-        if pos_type == "Shares":
-            exposure_shares = hedge.share_position_exposure_shares(share_qty, share_dir.lower())
-        else:
-            exposure_shares = hedge.option_position_exposure_shares(opt_delta, opt_contracts, opt_mult)
-
-        try:
-            underlying_price = underlying_price_input if underlying_price_input > 0 else data_fetch.get_stock_quote(underlying_symbol)["mark"]
-            hedge_price = hedge_price_input if hedge_price_input > 0 else data_fetch.get_stock_quote(hedge_symbol)["mark"]
-        except Exception as exc:
-            st.error(f"Couldn't fetch a live price ({exc}) — enter prices manually above.")
-            return
-        if not underlying_price or not hedge_price:
-            st.error("Couldn't get live prices for one of the symbols — enter them manually above.")
-            return
-
-        beta_est = None
-        if beta_manual is not None:
-            beta = beta_manual
-        else:
-            try:
-                hist_u = fetch_price_history(underlying_symbol)
-                hist_h = fetch_price_history(hedge_symbol)
-                cutoff = pd.Timestamp.now(tz=hist_u["date"].dt.tz) - pd.Timedelta(days=lookback_days)
-                hist_u = hist_u[hist_u["date"] >= cutoff].set_index("date")["close"]
-                hist_h = hist_h[hist_h["date"] >= cutoff].set_index("date")["close"]
-                beta_est = hedge.estimate_beta(hedge.simple_returns(hist_u), hedge.simple_returns(hist_h))
-                beta = beta_est.beta
-            except Exception as exc:
-                st.error(f"Couldn't estimate beta from price history ({exc}) — switch to manual entry above.")
-                return
-
-        result = hedge.size_hedge(
-            exposure_shares=exposure_shares,
-            underlying_price=underlying_price,
-            beta=beta,
-            hedge_price=hedge_price,
-            hedge_contract_multiplier=hedge_mult,
-        )
-
-        st.session_state["hedge_calc"] = {
-            "pos_type": pos_type,
-            "underlying_symbol": underlying_symbol,
-            "hedge_symbol": hedge_symbol,
-            "underlying_price": underlying_price,
-            "hedge_price": hedge_price,
-            "hedge_mult": hedge_mult,
-            "beta": beta,
-            "beta_est": beta_est,
-            "lookback_days": lookback_days,
-            "result": result,
-            "exposure_shares": exposure_shares,
-            "opt_side": opt_side,
-            "opt_strike": opt_strike,
-            "opt_premium": opt_premium,
-            "opt_contracts": opt_contracts,
-            "opt_mult": opt_mult,
-            "share_entry_price": share_entry_price if share_entry_price else underlying_price if pos_type == "Shares" else None,
-        }
-
-    calc = st.session_state.get("hedge_calc")
-    if not calc:
-        st.info("Fill in the position and hedge instrument above, then click Calculate.")
-        return
-
-    result = calc["result"]
-    hedge_symbol = calc["hedge_symbol"]
-    hedge_mult = calc["hedge_mult"]
-
-    if calc["beta_est"] is not None:
-        st.markdown("##### Beta estimate")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Beta", f"{calc['beta_est'].beta:.4f}")
-        c2.metric("R² (variance explained)", f"{calc['beta_est'].r_squared:.1%}")
-        c3.metric("Observations", f"{calc['beta_est'].n_obs}")
-        st.caption(f"{calc['lookback_days']}-day daily-return regression of {calc['underlying_symbol']} on {hedge_symbol}. Re-run periodically — this drifts.")
-
-    st.markdown("##### Hedge")
-    if result.direction == "long":
-        st.success(f"**BUY / LONG** {hedge_symbol}")
-    else:
-        st.error(f"**SELL / SHORT** {hedge_symbol}")
-
-    c1, c2, c3 = st.columns(3)
-    unit_label = "contracts" if hedge_mult > 1 else "shares"
-    c1.metric(f"{hedge_symbol} {unit_label} needed", f"{abs(result.hedge_units):,.2f}")
-    c2.metric("Hedge notional", money(abs(result.hedge_dollars)))
-    c3.metric("Position exposure", f"{result.exposure_shares:+,.1f} sh eq. ({money(result.exposure_dollars)})")
-
-    st.caption(
-        "hedge_dollars = -(exposure_shares × underlying_price) × beta, then divided by "
-        "(hedge_price × units_per_contract). Delta and beta both drift — treat this as a "
-        "starting size to re-check, not a fire-and-forget position."
-    )
-
-    render_hedge_scenario(calc)
-
-
-def render_hedge_scenario(calc: dict):
-    """Movable P&L scenario chart for whatever position/hedge was just calculated
-    above — drag the slider to any underlying move, bearish or bullish."""
-    st.markdown("##### Scenario P&L (movable)")
-
-    if calc["pos_type"] == "Option" and not calc["opt_strike"]:
-        st.caption("Enter a strike above (in the Position column) to see the scenario chart for an option position.")
-        return
-
-    move_pct = st.slider(
-        f"{calc['underlying_symbol']} price move (%)", min_value=-30.0, max_value=30.0, value=-5.0, step=0.25, key="hedge_scenario_move"
-    )
-
-    xs = [round(x * 0.5, 2) for x in range(-60, 61)]  # -30% .. +30% in 0.5% steps
-    underlying_price = calc["underlying_price"]
-    hedge_price = calc["hedge_price"]
-    beta = calc["beta"]
-    result = calc["result"]
-
-    def position_pl(pct: float) -> float:
-        s_t = underlying_price * (1 + pct / 100)
-        if calc["pos_type"] == "Shares":
-            return hedge.share_position_pl(s_t, calc["share_entry_price"], calc["exposure_shares"])
-        return hedge.option_intrinsic_pl(
-            s_t, calc["opt_strike"], calc["opt_premium"], calc["opt_side"].lower(), calc["opt_contracts"], calc["opt_mult"]
-        )
-
-    def hedge_pl(pct: float) -> float:
-        hedge_move_pct = pct / beta if beta else 0.0
-        hedge_t = hedge_price * (1 + hedge_move_pct / 100)
-        return hedge.hedge_instrument_pl(hedge_t, hedge_price, result.hedge_units)
-
-    pos_series = [position_pl(x) for x in xs]
-    hedge_series = [hedge_pl(x) for x in xs]
-    combined_series = [p + h for p, h in zip(pos_series, hedge_series)]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=xs, y=pos_series, mode="lines", name="Position", line=dict(color=colors.CATEGORICAL[0], width=2)))
-    fig.add_trace(go.Scatter(x=xs, y=hedge_series, mode="lines", name="Hedge", line=dict(color=colors.CATEGORICAL[7], width=2)))
-    fig.add_trace(go.Scatter(x=xs, y=combined_series, mode="lines", name="Combined", line=dict(color=colors.CATEGORICAL[1], width=3)))
-    fig.add_hline(y=0, line=dict(color=colors.INK_MUTED, dash="dash", width=1))
-    fig.add_vline(x=move_pct, line=dict(color=colors.INK_PRIMARY, width=1, dash="dot"))
-    fig.update_layout(
-        height=340,
-        margin=dict(l=10, r=10, t=10, b=10),
-        plot_bgcolor=colors.SURFACE,
-        paper_bgcolor=colors.SURFACE,
-        xaxis=dict(title=f"{calc['underlying_symbol']} price move (%)", showgrid=False, color=colors.INK_MUTED, ticksuffix="%"),
-        yaxis=dict(title="P&L ($)", showgrid=True, gridcolor=colors.GRIDLINE, zerolinecolor=colors.INK_MUTED, color=colors.INK_MUTED, tickprefix="$"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    pos_at_scenario = position_pl(move_pct)
-    hedge_at_scenario = hedge_pl(move_pct)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Position P&L", money(pos_at_scenario))
-    c2.metric("Hedge P&L", money(hedge_at_scenario))
-    c3.metric("Combined P&L", money(pos_at_scenario + hedge_at_scenario))
-
-    label = "expiration (intrinsic value only)" if calc["pos_type"] == "Option" else "the scenario price"
-    st.caption(
-        f"P&L at {label}. The hedge leg assumes {calc['hedge_symbol']} moves exactly {beta:.4f}x less than "
-        f"{calc['underlying_symbol']}'s move (the beta relationship) — real moves deviate from this, which is "
-        "exactly the risk a beta hedge doesn't cover."
-    )
-
-
-def render_strategy_payoff(d: dict):
-    st.subheader("Multi-leg option strategy payoff")
-    st.caption(
-        "Max profit, max loss, and breakeven(s) for any combination of calls/puts on one underlying, "
-        "at expiration — exact values, derived from the payoff's piecewise-linear shape rather than a "
-        "numeric approximation. Works for any spread (bull call, bear put, straddle, etc.), not just one strategy."
-    )
-
-    opt = d["option_positions"]
-    combo_labels = ["Manual entry"]
-    combo_lookup = {}
-    if not opt.empty:
-        for (symbol, expiration), group in opt.groupby(["symbol", "expiration"]):
-            if len(group) >= 2:
-                label = f"{symbol} exp {expiration} ({len(group)} legs)"
-                combo_labels.append(label)
-                combo_lookup[label] = group
-
-    chosen = st.selectbox("Prefill from an open multi-leg position (optional)", combo_labels)
-    prefill_group = combo_lookup.get(chosen)
-
-    with st.form("strategy_payoff_inputs"):
-        default_symbol = prefill_group.iloc[0]["symbol"] if prefill_group is not None else ""
-        underlying_symbol = st.text_input("Underlying symbol (centers the chart's price range)", value=default_symbol).strip().upper()
-
-        default_n_legs = len(prefill_group) if prefill_group is not None else 2
-        n_legs = st.number_input("Number of legs", min_value=1, max_value=4, value=default_n_legs, step=1)
-
-        leg_inputs = []
-        for i in range(int(n_legs)):
-            st.markdown(f"###### Leg {i + 1}")
-            if prefill_group is not None and i < len(prefill_group):
-                row = prefill_group.iloc[i]
-                d_side = "Long" if row["side"] == "long" else "Short"
-                d_type = row["type"].capitalize()
-                d_strike = float(row["strike"])
-                d_premium = abs(float(row["avg_price"]))
-                d_contracts = abs(float(row["quantity"]))
-            else:
-                d_side, d_type, d_strike, d_premium, d_contracts = "Long", "Call", 0.0, 0.0, 1.0
-
-            c1, c2, c3, c4, c5 = st.columns(5)
-            side = c1.selectbox("Side", ["Long", "Short"], index=0 if d_side == "Long" else 1, key=f"leg_side_{i}")
-            opt_type = c2.selectbox("Type", ["Call", "Put"], index=0 if d_type == "Call" else 1, key=f"leg_type_{i}")
-            strike = c3.number_input("Strike ($)", min_value=0.0, value=d_strike, step=0.5, key=f"leg_strike_{i}")
-            premium = c4.number_input("Premium ($/share)", min_value=0.0, value=d_premium, step=0.01, key=f"leg_premium_{i}")
-            contracts = c5.number_input("Contracts", min_value=1.0, value=d_contracts, step=1.0, key=f"leg_contracts_{i}")
-            leg_inputs.append((side, opt_type, strike, premium, contracts))
-
-        submitted = st.form_submit_button("Analyze", type="primary")
-
-    if not submitted:
-        st.info("Set up your legs above (or pick an open position to prefill) and click Analyze.")
-        return
-
-    legs = [
-        option_strategy.OptionLeg(
-            option_type=opt_type.lower(), strike=strike, premium=premium,
-            contracts=contracts if side == "Long" else -contracts,
-        )
-        for side, opt_type, strike, premium, contracts in leg_inputs
-        if strike > 0
-    ]
-    if not legs:
-        st.error("Enter at least one leg with a strike > 0.")
-        return
-
+def _render_strategy_profile(
+    legs: list, underlying_symbol: str, key_suffix: str,
+    current_pl: float | None = None, dte: int | None = None, live_capable: bool = False,
+):
+    """Shared summary-metrics + payoff-chart renderer for the Strategy Payoff
+    tab — used both for auto-detected open positions and the manual what-if
+    builder below. When live_capable (every leg has a current IV) and dte is
+    a real positive number, plots a second curve: mark-to-market P&L *today*
+    (Black-Scholes-repriced at each leg's current IV and the real time
+    remaining) alongside the plain at-expiration intrinsic-value payoff —
+    those two are NOT the same thing before expiration, and time value is
+    exactly the gap between them."""
     profile = option_strategy.analyze_strategy(legs)
 
-    st.markdown("##### Strategy summary")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Max profit", money(profile.max_profit) if profile.max_profit is not None else "Unlimited")
-    c2.metric("Max loss", money(profile.max_loss) if profile.max_loss is not None else "Unlimited")
+    cols = st.columns(5 if current_pl is not None else 4)
+    cols[0].metric("Max profit", money(profile.max_profit) if profile.max_profit is not None else "Unlimited")
+    cols[1].metric("Max loss", money(profile.max_loss) if profile.max_loss is not None else "Unlimited")
     debit_label = "paid" if profile.net_debit >= 0 else "received"
-    c3.metric("Net debit / credit", f"{money(abs(profile.net_debit))} ({debit_label})")
-    c4.metric("Breakeven(s)", ", ".join(f"${b:,.2f}" for b in profile.breakevens) if profile.breakevens else "—")
+    cols[2].metric("Net debit / credit", f"{money(abs(profile.net_debit))} ({debit_label})")
+    cols[3].metric("Breakeven(s)", ", ".join(f"${b:,.2f}" for b in profile.breakevens) if profile.breakevens else "—")
+    if current_pl is not None:
+        pct_of_max = f" ({current_pl / profile.max_profit:+.0%} of max profit)" if profile.max_profit else None
+        cols[4].metric("Current unrealized P&L (live, Robinhood)", money(current_pl), pct_of_max)
+
+    if dte is not None:
+        st.caption(f"{dte} day(s) to expiration.")
 
     spot = None
     if underlying_symbol:
@@ -1067,10 +664,21 @@ def render_strategy_payoff(d: dict):
 
     n_points = 200
     xs = [x_min + i * (x_max - x_min) / (n_points - 1) for i in range(n_points)]
-    ys = [option_strategy.strategy_pl(legs, x) for x in xs]
+    ys_expiry = [option_strategy.strategy_pl(legs, x) for x in xs]
+
+    show_live = live_capable and dte is not None and dte > 0
+    ys_live = None
+    if show_live:
+        T_years = dte / 365.0
+        try:
+            ys_live = [option_strategy.strategy_pl_today(legs, x, T_years) for x in xs]
+        except ValueError:
+            show_live = False
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color=colors.CATEGORICAL[0], width=2.5), name="P&L at expiration"))
+    fig.add_trace(go.Scatter(x=xs, y=ys_expiry, mode="lines", line=dict(color=colors.CATEGORICAL[0], width=2.5), name="P&L at expiration"))
+    if show_live:
+        fig.add_trace(go.Scatter(x=xs, y=ys_live, mode="lines", line=dict(color=colors.CATEGORICAL[7], width=2.5), name="P&L today (live, current IV)"))
     fig.add_hline(y=0, line=dict(color=colors.INK_MUTED, dash="dash", width=1))
     for be in profile.breakevens:
         if x_min <= be <= x_max:
@@ -1082,16 +690,102 @@ def render_strategy_payoff(d: dict):
         margin=dict(l=10, r=10, t=20, b=10),
         plot_bgcolor=colors.SURFACE,
         paper_bgcolor=colors.SURFACE,
-        xaxis=dict(title="Underlying price at expiration ($)", showgrid=False, color=colors.INK_MUTED),
+        xaxis=dict(title="Underlying price ($)", showgrid=False, color=colors.INK_MUTED),
         yaxis=dict(title="P&L ($)", showgrid=True, gridcolor=colors.GRIDLINE, zerolinecolor=colors.INK_MUTED, color=colors.INK_MUTED, tickprefix="$"),
-        showlegend=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1) if show_live else dict(),
+        showlegend=show_live,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"strategy_chart_{key_suffix}")
+    if show_live:
+        st.caption(
+            "Blue = P&L at expiration (intrinsic value only). Orange = P&L today, repriced via Black-Scholes at each "
+            "leg's current implied vol and the real time remaining — this is the honest 'if I closed it right now' "
+            "curve. They converge onto each other as expiration approaches and time value decays to zero."
+        )
+    else:
+        st.caption(
+            "P&L at expiration (intrinsic value only, no remaining time value) — the standard payoff-diagram convention. "
+            "\"Unlimited\" means the payoff keeps moving in that direction indefinitely past the highest strike, not a "
+            "very large but finite number."
+        )
+
+
+def render_strategy_payoff(d: dict):
+    st.subheader("Multi-leg option strategy payoff")
     st.caption(
-        "P&L at expiration (intrinsic value only, no remaining time value) — the standard payoff-diagram convention. "
-        "\"Unlimited\" means the payoff keeps moving in that direction indefinitely past the highest strike "
-        "(e.g. an uncovered long or short call), not a very large but finite number."
+        "Max profit, max loss, and breakeven(s) for any combination of calls/puts on one underlying — exact, "
+        "from the payoff's piecewise-linear shape at expiration, plus a live mark-to-market curve using each "
+        "leg's current implied vol and real time remaining for your actual open positions."
     )
+
+    opt = d["option_positions"]
+    combos = []
+    if not opt.empty:
+        for (symbol, expiration), group in opt.groupby(["symbol", "expiration"]):
+            if len(group) >= 2:
+                combos.append((symbol, expiration, group))
+
+    st.markdown("##### Your running trades")
+    if not combos:
+        st.caption("No open positions with 2+ legs on the same underlying/expiration — nothing to auto-detect right now.")
+    for symbol, expiration, group in combos:
+        legs = [
+            option_strategy.OptionLeg(
+                option_type=row["type"], strike=float(row["strike"]), premium=abs(float(row["avg_price"])),
+                contracts=float(row["quantity"]) if row["side"] == "long" else -float(row["quantity"]),
+                iv=float(row["implied_volatility"]) if pd.notna(row["implied_volatility"]) and row["implied_volatility"] > 0 else None,
+            )
+            for _, row in group.iterrows()
+        ]
+        leg_desc = " / ".join(
+            f"{row['side']} {row['quantity']:.0f}x ${row['strike']:.2f}{row['type'][0].upper()}" for _, row in group.iterrows()
+        )
+        with st.expander(f"**{symbol}** exp {expiration} — {leg_desc}", expanded=True):
+            current_pl = float(group["unrealized_pl"].sum())
+            dte = int(group["dte"].iloc[0]) if pd.notna(group["dte"].iloc[0]) else None
+            live_capable = all(leg.iv is not None for leg in legs)
+            _render_strategy_profile(legs, symbol, key_suffix=f"{symbol}_{expiration}", current_pl=current_pl, dte=dte, live_capable=live_capable)
+
+    st.divider()
+    st.markdown("##### Explore a hypothetical strategy")
+    with st.form("strategy_payoff_inputs"):
+        underlying_symbol = st.text_input("Underlying symbol (centers the chart's price range)", value="").strip().upper()
+        dte_input = st.number_input("Days to expiration (for the live curve)", min_value=0, value=30, step=1)
+        n_legs = st.number_input("Number of legs", min_value=1, max_value=4, value=2, step=1)
+
+        leg_inputs = []
+        for i in range(int(n_legs)):
+            st.markdown(f"###### Leg {i + 1}")
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            side = c1.selectbox("Side", ["Long", "Short"], key=f"leg_side_{i}")
+            opt_type = c2.selectbox("Type", ["Call", "Put"], key=f"leg_type_{i}")
+            strike = c3.number_input("Strike ($)", min_value=0.0, value=0.0, step=0.5, key=f"leg_strike_{i}")
+            premium = c4.number_input("Premium ($/share)", min_value=0.0, value=0.0, step=0.01, key=f"leg_premium_{i}")
+            contracts = c5.number_input("Contracts", min_value=1.0, value=1.0, step=1.0, key=f"leg_contracts_{i}")
+            iv_pct = c6.number_input("IV (%)", min_value=0.0, value=30.0, step=1.0, key=f"leg_iv_{i}")
+            leg_inputs.append((side, opt_type, strike, premium, contracts, iv_pct))
+
+        submitted = st.form_submit_button("Analyze", type="primary")
+
+    if not submitted:
+        st.info("Set up your legs above and click Analyze.")
+        return
+
+    legs = [
+        option_strategy.OptionLeg(
+            option_type=opt_type.lower(), strike=strike, premium=premium,
+            contracts=contracts if side == "Long" else -contracts,
+            iv=(iv_pct / 100.0) if iv_pct > 0 else None,
+        )
+        for side, opt_type, strike, premium, contracts, iv_pct in leg_inputs
+        if strike > 0
+    ]
+    if not legs:
+        st.error("Enter at least one leg with a strike > 0.")
+        return
+
+    live_capable = all(leg.iv is not None for leg in legs)
+    _render_strategy_profile(legs, underlying_symbol, key_suffix="manual", dte=int(dte_input), live_capable=live_capable)
 
 
 def render_orders(d: dict):
@@ -1216,15 +910,6 @@ def render_win_rate(d: dict):
 def main():
     st.title("📉 Vol Trading Dashboard")
 
-    if is_demo_mode():
-        st.info(
-            "🎭 **Demo mode** — every number on this page is synthetic (generated by `app/demo_data.py`), "
-            "regenerated deterministically per session. This is not a real brokerage account, and no live "
-            "trading connection exists in this deployment. The pricing/Greeks math itself (`risk_tool/`) is "
-            "the real engine — only the input data is fake.",
-            icon="🎭",
-        )
-
     if not ensure_logged_in():
         return
 
@@ -1234,7 +919,7 @@ def main():
     with top_r:
         if st.button("Refresh"):
             load_data.clear()
-        if not is_demo_mode() and st.button("Log out"):
+        if st.button("Log out"):
             logout()
             st.rerun()
 
@@ -1243,8 +928,7 @@ def main():
     tabs = st.tabs(
         [
             "Overview", "Positions & Greeks", "Vol Exposure", "Vol Skew", "Risk Tool",
-            "Correlation Explorer", "Hedge Calculator", "Strategy Payoff",
-            "Orders & History", "Win Rate", "Journal / Export",
+            "Strategy Payoff", "Orders & History", "Win Rate", "Journal / Export",
         ]
     )
     with tabs[0]:
@@ -1260,16 +944,12 @@ def main():
         st.divider()
         render_position_monitor(d)
     with tabs[5]:
-        render_correlation_explorer(d)
-    with tabs[6]:
-        render_hedge_calculator(d)
-    with tabs[7]:
         render_strategy_payoff(d)
-    with tabs[8]:
+    with tabs[6]:
         render_orders(d)
-    with tabs[9]:
+    with tabs[7]:
         render_win_rate(d)
-    with tabs[10]:
+    with tabs[8]:
         render_journal(d)
 
 

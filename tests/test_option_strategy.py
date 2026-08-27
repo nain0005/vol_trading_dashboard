@@ -2,7 +2,7 @@
 values, including the real CSCO bull call spread this module was built for."""
 import pytest
 
-from risk_tool.option_strategy import OptionLeg, analyze_strategy, net_debit, strategy_pl
+from risk_tool.option_strategy import OptionLeg, analyze_strategy, net_debit, strategy_pl, strategy_pl_today
 
 
 class TestBullCallSpread:
@@ -81,3 +81,40 @@ class TestUnboundedStrategies:
 def test_analyze_strategy_rejects_empty_legs():
     with pytest.raises(ValueError):
         analyze_strategy([])
+
+
+class TestStrategyPlToday:
+    def test_converges_to_intrinsic_payoff_as_expiration_approaches(self):
+        """As T_years -> 0, the Black-Scholes-repriced 'live' curve must
+        converge to the same intrinsic-value payoff strategy_pl computes —
+        time value vanishes at expiration by definition. Spot values exactly
+        AT a strike are excluded: combined with a near-zero T that's a
+        genuine floating-point degenerate limit (d1/d2 involve dividing by
+        sigma*sqrt(T), and log(S/K)=0 exactly at the strike), not a
+        correctness question — away from that exact boundary (checked here
+        down to a still-tiny 1-hour T) it converges to fractions of a cent."""
+        legs = [
+            OptionLeg(option_type="call", strike=113.0, premium=3.05, contracts=1, iv=0.30),
+            OptionLeg(option_type="call", strike=115.0, premium=2.25, contracts=-1, iv=0.30),
+        ]
+        T_one_hour = 1 / 365 / 24
+        for spot in [100.0, 108.0, 114.0, 120.0, 130.0]:
+            today = strategy_pl_today(legs, spot, T_years=T_one_hour, r=0.05)
+            expiry = strategy_pl(legs, spot)
+            assert today == pytest.approx(expiry, abs=0.5)
+
+    def test_live_curve_differs_from_intrinsic_with_real_time_remaining(self):
+        """With real time and vol left, the mark-to-market value should NOT
+        equal pure intrinsic value at a strike (there's real time value
+        priced in) — this is the whole point of the 'live' curve existing
+        as a separate thing from the at-expiration payoff."""
+        legs = [OptionLeg(option_type="call", strike=100.0, premium=4.0, contracts=1, iv=0.30)]
+        at_strike_intrinsic = strategy_pl(legs, 100.0)  # = -premium, since intrinsic value is 0 exactly at the strike
+        at_strike_today = strategy_pl_today(legs, 100.0, T_years=30 / 365, r=0.05)
+        assert at_strike_today != pytest.approx(at_strike_intrinsic, abs=0.5)
+        assert at_strike_today > at_strike_intrinsic  # real time value makes it worth more than pure intrinsic
+
+    def test_raises_when_iv_missing(self):
+        legs = [OptionLeg(option_type="call", strike=100.0, premium=4.0, contracts=1)]  # no iv set
+        with pytest.raises(ValueError):
+            strategy_pl_today(legs, 100.0, T_years=30 / 365)

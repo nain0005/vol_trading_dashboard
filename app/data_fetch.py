@@ -85,6 +85,23 @@ def _safe_float(value, default=0.0):
         return default
 
 
+def option_unrealized_pl(side: str, avg_price: float, mark_price: float, qty: float, multiplier: int = 100) -> float:
+    """Unrealized P&L for one option leg.
+
+    Robinhood reports `average_price` already sign-flipped for short
+    positions (negative — representing a credit received), which is NOT the
+    same convention as `mark_price` (always a plain positive market quote).
+    Naively doing (mark_price - avg_price) * signed_qty double-applies that
+    sign for shorts, producing a phantom loss roughly 2x the true premium
+    regardless of the actual current price. Unsign avg_price explicitly and
+    branch on side instead — the only correct way to combine a
+    sign-carrying field with a sign-free one."""
+    avg_price_magnitude = abs(avg_price)
+    if side == "long":
+        return (mark_price - avg_price_magnitude) * qty * multiplier
+    return (avg_price_magnitude - mark_price) * qty * multiplier
+
+
 def get_option_positions() -> pd.DataFrame:
     positions = rh.options.get_open_option_positions() or []
     rows = []
@@ -127,7 +144,7 @@ def get_option_positions() -> pd.DataFrame:
                 "avg_price": avg_price,
                 "mark_price": mark_price,
                 "market_value": mark_price * qty * multiplier,
-                "unrealized_pl": (mark_price - avg_price) * signed_qty * multiplier,
+                "unrealized_pl": option_unrealized_pl(side, avg_price, mark_price, qty, multiplier),
                 "delta": _safe_float(market_data.get("delta")) * signed_qty * multiplier,
                 "theta": _safe_float(market_data.get("theta")) * signed_qty * multiplier,
                 "vega": _safe_float(market_data.get("vega")) * signed_qty * multiplier,

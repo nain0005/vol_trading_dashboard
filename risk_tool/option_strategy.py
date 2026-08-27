@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from risk_tool.hedge import option_intrinsic_pl
+from risk_tool.pricing import black_scholes_price
 
 UNBOUNDED_SLOPE_EPS = 1e-6
 
@@ -29,6 +30,7 @@ class OptionLeg:
     premium: float  # per-share premium, always a positive magnitude
     contracts: float  # signed: positive = long, negative = short
     shares_per_contract: float = 100.0
+    iv: float | None = None  # current implied vol, e.g. 0.35 — only needed for strategy_pl_today
 
 
 def leg_pl(leg: OptionLeg, spot_at_expiration: float) -> float:
@@ -40,6 +42,26 @@ def leg_pl(leg: OptionLeg, spot_at_expiration: float) -> float:
 def strategy_pl(legs: list[OptionLeg], spot_at_expiration: float) -> float:
     """Combined P&L of every leg at a given terminal underlying price."""
     return sum(leg_pl(leg, spot_at_expiration) for leg in legs)
+
+
+def leg_pl_today(leg: OptionLeg, spot: float, T_years: float, r: float = 0.05, q: float = 0.0) -> float:
+    """Mark-to-market P&L for one leg right now — reprices via Black-Scholes
+    at the leg's own current IV and the shared time remaining, instead of
+    assuming only intrinsic value (which is only correct exactly at
+    expiration). Requires leg.iv to be set."""
+    if leg.iv is None:
+        raise ValueError(f"leg at strike {leg.strike} has no iv set — strategy_pl_today needs every leg's current IV")
+    if T_years <= 0:
+        return leg_pl(leg, spot)  # at/past expiration, Black-Scholes needs T>0 — intrinsic value is exact here anyway
+    price = black_scholes_price(spot, leg.strike, T_years, r, q, leg.iv, leg.option_type)
+    return (price - leg.premium) * leg.contracts * leg.shares_per_contract
+
+
+def strategy_pl_today(legs: list[OptionLeg], spot: float, T_years: float, r: float = 0.05, q: float = 0.0) -> float:
+    """Combined mark-to-market P&L right now (not at expiration) — the
+    "live" curve: what the strategy is actually worth today, given how much
+    time value and vol premium remain, rather than only its terminal shape."""
+    return sum(leg_pl_today(leg, spot, T_years, r, q) for leg in legs)
 
 
 def net_debit(legs: list[OptionLeg]) -> float:
