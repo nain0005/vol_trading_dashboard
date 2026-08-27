@@ -552,6 +552,20 @@ def render_position_monitor(d: dict):
 
         dte = int(pos["dte"]) if pd.notna(pos["dte"]) else 999
         per_contract_delta = pos["delta"] / (pos["quantity"] * 100) if pos["quantity"] else 0.0
+        label = f"{pos['symbol']} ${pos['strike']:.2f} {pos['type']} exp {pos['expiration']} ({pos['side']} x{pos['quantity']:.0f})"
+
+        if pos["avg_price"] <= 0:
+            # risk_manager.Position's %P&L exit rules (profit target, stop
+            # loss) are built for LONG-premium positions only — see its
+            # module docstring. Robinhood reports average_price as negative
+            # for short positions (a credit received, not a debit paid),
+            # which fails pct_pnl's entry_premium > 0 requirement by design,
+            # not because the data is missing. Skip rather than crash; a
+            # zero avg_price (assignment/exercise/very old fills) hits this
+            # same branch too, so the message covers both.
+            reason = "it's a short position (risk_manager's %P&L rules are long-only)" if pos["avg_price"] < 0 else "Robinhood reports no entry price for it"
+            st.warning(f"**{label}** — skipped: {reason}, so %P&L-based exit rules can't be evaluated.")
+            continue
 
         position = risk_manager.Position(
             symbol=pos["symbol"],
@@ -569,7 +583,6 @@ def render_position_monitor(d: dict):
         signals = risk_manager.evaluate_all_rules(position, config)
         triggered = [s for s in signals if s.triggered]
 
-        label = f"{pos['symbol']} ${pos['strike']:.2f} {pos['type']} exp {pos['expiration']} ({pos['side']} x{pos['quantity']:.0f})"
         if triggered:
             st.error(f"**{label}** — {len(triggered)} exit rule(s) triggered")
             for s in triggered:
