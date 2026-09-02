@@ -204,3 +204,123 @@ def garch_forecast_vol(fit: GarchFit, horizon_days: int = 1, annualization_facto
         horizon_var = lrv + (fit.persistence ** (horizon_days - 1)) * (one_step_var - lrv)
 
     return math.sqrt(max(horizon_var, 0.0) * annualization_factor)
+
+
+_E_ABS_Z = math.sqrt(2 / math.pi)  # E|z| for a standard normal z — the EGARCH innovation-magnitude baseline
+
+
+@dataclass
+class EGarchFit:
+    """A fitted EGARCH(1,1):
+
+        ln(sigma_t^2) = omega + beta*ln(sigma_{t-1}^2) + alpha*(|z_{t-1}| - E|z|) + gamma*z_{t-1}
+
+    where z_{t-1} = r_{t-1} / sigma_{t-1} is the standardized residual.
+    Modeling log-variance (rather than variance itself, as GARCH does) means
+    omega/alpha/gamma need no positivity constraints — only |beta| < 1 for
+    stationarity. `gamma` is the leverage/asymmetry term this whole model
+    exists for: gamma < 0 means a negative return raises next-period
+    variance more than a positive return of the same size, which is the
+    empirical pattern plain GARCH (symmetric in r^2) can't represent at all.
+    """
+
+    omega: float
+    alpha: float
+    beta: float
+    gamma: float
+    mean_return: float
+    demeaned_returns: np.ndarray = field(repr=False)
+    log_conditional_variance: np.ndarray = field(repr=False)  # ln(sigma_t^2), same length as demeaned_returns
+
+    @property
+    def long_run_variance(self) -> float:
+        """exp(omega / (1 - beta)) — taking expectations of the recursion:
+        E[alpha*(|z|-E|z|)] = 0 and E[gamma*z] = 0 for a standardized
+        innovation, so E[ln(sigma^2)] settles at omega/(1-beta)."""
+        return math.exp(self.omega / (1 - self.beta))
+
+    @property
+    def persistence(self) -> float:
+        return self.beta
+
+
+def _egarch_log_variance_path(r: np.ndarray, omega: float, alpha: float, beta: float, gamma: float, log_sample_var: float) -> np.ndarray:
+    n = len(r)
+    ln_sigma2 = np.empty(n)
+    ln_sigma2[0] = log_sample_var
+    z_prev = r[0] / math.sqrt(math.exp(ln_sigma2[0]))
+    for t in range(1, n):
+        ln_sigma2[t] = omega + beta * ln_sigma2[t - 1] + alpha * (abs(z_prev) - _E_ABS_Z) + gamma * z_prev
+        z_prev = r[t] / math.sqrt(math.exp(ln_sigma2[t]))
+    return ln_sigma2
+
+
+def fit_egarch_11(returns: pd.Series) -> EGarchFit:
+    """Fit EGARCH(1,1) by maximum likelihood (Gaussian conditional density).
+
+    Same NLL form as fit_garch_11 — 0.5 * sum(ln(2*pi*sigma_t^2) + r_t^2/sigma_t^2)
+    — but sigma_t^2 = exp(ln_sigma_t^2) comes from the asymmetric log-variance
+    recursion above instead of GARCH's symmetric one. Only beta is bounded
+    (stationarity); omega, alpha, gamma are otherwise free, since log-space
+    has no positivity constraint to enforce.
+    """
+    r = returns.dropna().to_numpy(dtype=float)
+    if len(r) < 30:
+        raise ValueError("EGARCH(1,1) needs a reasonably long return history (30+ points) to fit sensibly.")
+    mean_r = float(r.mean())
+    r = r - mean_r
+    sample_var = float(r.var(ddof=1))
+    if sample_var <= 0:
+        raise ValueError("Returns have zero variance — can't fit EGARCH.")
+    log_sample_var = math.log(sample_var)
+
+    def neg_log_likelihood(params: np.ndarray) -> float:
+        omega, alpha, beta, gamma = params
+        if not (-0.999 < beta < 0.999):
+            return 1e10  # infeasible region — push the optimizer away
+        try:
+            ln_sigma2 = _egarch_log_variance_path(r, omega, alpha, beta, gamma, log_sample_var)
+        except (OverflowError, FloatingPointError):
+            return 1e10
+        if not np.all(np.isfinite(ln_sigma2)):
+            return 1e10
+        sigma2 = np.exp(np.clip(ln_sigma2, -50, 50))  # clip guards exp() overflow during off-path optimizer probes
+        return 0.5 * float(np.sum(np.log(2 * np.pi * sigma2) + r**2 / sigma2))
+
+    initial_guess = [log_sample_var * 0.05, 0.10, 0.90, -0.05]
+    bounds = [(None, None), (-5.0, 5.0), (-0.999, 0.999), (-5.0, 5.0)]
+    result = minimize(neg_log_likelihood, initial_guess, bounds=bounds, method="L-BFGS-B")
+    omega, alpha, beta, gamma = result.x
+
+    ln_sigma2 = _egarch_log_variance_path(r, omega, alpha, beta, gamma, log_sample_var)
+    return EGarchFit(omega=omega, alpha=alpha, beta=beta, gamma=gamma, mean_return=mean_r, demeaned_returns=r, log_conditional_variance=ln_sigma2)
+
+
+def egarch_forecast_vol(fit: EGarchFit, horizon_days: int = 1, annualization_factor: int = TRADING_DAYS_PER_YEAR) -> float:
+    """h-day-ahead annualized vol forecast from a fitted EGARCH(1,1).
+
+    One-step uses the actual last observed return, so it directly captures
+    whatever asymmetric shock just happened — a big DOWN day raises this
+    forecast more than an equally-sized UP day would, via the gamma term.
+    Multi-step mean-reverts geometrically toward the long-run log-variance
+    at rate beta per day (the same mean-reversion idea as GARCH's forecast,
+    carried out in log-space, since E[alpha*(|z|-E|z|)] = E[gamma*z] = 0 for
+    unrealized future shocks under the standard-normal assumption):
+
+        ln(sigma^2_{t+h}) = LRLV + beta^(h-1) * (ln(sigma^2_{t+1}) - LRLV)
+    """
+    if horizon_days < 1:
+        raise ValueError("horizon_days must be >= 1")
+
+    last_ln_sigma2 = fit.log_conditional_variance[-1]
+    last_return = fit.demeaned_returns[-1]
+    z_last = last_return / math.sqrt(math.exp(last_ln_sigma2))
+    one_step_ln_var = fit.omega + fit.beta * last_ln_sigma2 + fit.alpha * (abs(z_last) - _E_ABS_Z) + fit.gamma * z_last
+
+    long_run_ln_var = fit.omega / (1 - fit.beta)
+    if horizon_days == 1:
+        horizon_ln_var = one_step_ln_var
+    else:
+        horizon_ln_var = long_run_ln_var + (fit.persistence ** (horizon_days - 1)) * (one_step_ln_var - long_run_ln_var)
+
+    return math.sqrt(math.exp(horizon_ln_var) * annualization_factor)

@@ -14,7 +14,10 @@ import pandas as pd
 import pytest
 
 from risk_tool.realized_vol import (
+    EGarchFit,
     close_to_close_vol,
+    egarch_forecast_vol,
+    fit_egarch_11,
     fit_garch_11,
     garch_forecast_vol,
     garman_klass_vol,
@@ -126,3 +129,89 @@ class TestGarch:
         fit = fit_garch_11(returns)
         with pytest.raises(ValueError):
             garch_forecast_vol(fit, horizon_days=0)
+
+
+class TestEgarch:
+    @pytest.fixture
+    def returns(self):
+        """Synthetic returns from a genuine EGARCH(1,1) process with a real
+        negative gamma (leverage effect), so the fit has real asymmetric
+        structure to recover rather than pure noise."""
+        rng = np.random.default_rng(11)
+        n = 1000
+        omega, alpha, beta, gamma = -0.10, 0.10, 0.95, -0.08
+        e_abs_z = math.sqrt(2 / math.pi)
+        ln_sigma2 = np.empty(n)
+        r = np.empty(n)
+        ln_sigma2[0] = omega / (1 - beta)
+        z0 = rng.normal(0, 1)
+        r[0] = z0 * math.sqrt(math.exp(ln_sigma2[0]))
+        z_prev = z0
+        for t in range(1, n):
+            ln_sigma2[t] = omega + beta * ln_sigma2[t - 1] + alpha * (abs(z_prev) - e_abs_z) + gamma * z_prev
+            z_prev = rng.normal(0, 1)
+            r[t] = z_prev * math.sqrt(math.exp(ln_sigma2[t]))
+        return pd.Series(r)
+
+    def test_fit_is_stationary_and_well_posed(self, returns):
+        fit = fit_egarch_11(returns)
+        assert -1.0 < fit.beta < 1.0
+        assert fit.persistence < 1.0
+        assert fit.long_run_variance > 0
+
+    def test_recovers_a_negative_gamma_from_data_with_real_leverage_effect(self, returns):
+        """The whole point of EGARCH over GARCH: fit on data actually
+        generated with a leverage effect (gamma=-0.08 in the fixture above)
+        should recover a negative gamma, not just noise around zero."""
+        fit = fit_egarch_11(returns)
+        assert fit.gamma < 0
+
+    def test_requires_minimum_history(self):
+        with pytest.raises(ValueError):
+            fit_egarch_11(pd.Series(np.random.default_rng(0).normal(0, 0.01, 10)))
+
+    def test_rejects_zero_variance_returns(self):
+        with pytest.raises(ValueError):
+            fit_egarch_11(pd.Series([0.01] * 40))
+
+    def test_forecast_converges_to_long_run_vol_at_long_horizon(self, returns):
+        fit = fit_egarch_11(returns)
+        long_horizon_vol = egarch_forecast_vol(fit, horizon_days=5000)
+        expected_long_run_vol = math.sqrt(fit.long_run_variance * 252)
+        assert long_horizon_vol == pytest.approx(expected_long_run_vol, rel=1e-2)
+
+    def test_one_step_forecast_is_positive_and_finite(self, returns):
+        fit = fit_egarch_11(returns)
+        vol = egarch_forecast_vol(fit, horizon_days=1)
+        assert vol > 0
+        assert math.isfinite(vol)
+
+    def test_rejects_invalid_horizon(self, returns):
+        fit = fit_egarch_11(returns)
+        with pytest.raises(ValueError):
+            egarch_forecast_vol(fit, horizon_days=0)
+
+    def test_leverage_effect_a_down_move_raises_the_forecast_more_than_an_equal_up_move(self):
+        """This is the actual behavior EGARCH exists for — direct answer to
+        'the stock just fell 9% and 5%, does that raise my near-term vol
+        forecast more than a +9%/+5% rally would have?'. Build two identical
+        fitted models differing only in the SIGN of the most recent return,
+        with a realistic negative gamma, and check the down-move forecast
+        comes out higher."""
+        common = dict(omega=-0.10, alpha=0.10, beta=0.90, gamma=-0.15, mean_return=0.0)
+        prior_ln_var = math.log(0.04 / 252)  # ~20% annualized vol level going into the shock
+
+        down_fit = EGarchFit(
+            **common,
+            demeaned_returns=np.array([-0.09]),
+            log_conditional_variance=np.array([prior_ln_var]),
+        )
+        up_fit = EGarchFit(
+            **common,
+            demeaned_returns=np.array([0.09]),
+            log_conditional_variance=np.array([prior_ln_var]),
+        )
+
+        down_vol = egarch_forecast_vol(down_fit, horizon_days=1)
+        up_vol = egarch_forecast_vol(up_fit, horizon_days=1)
+        assert down_vol > up_vol

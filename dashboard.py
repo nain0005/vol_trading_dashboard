@@ -1,4 +1,5 @@
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -416,7 +417,10 @@ def render_risk_tool(d: dict):
 
         c7, c8 = st.columns(2)
         account_override = c7.number_input("Account size ($)", min_value=0.0, value=account_equity, step=1000.0)
-        use_realized = c8.checkbox("Compute realized vol from 1yr price history (adds the realized-vs-implied edge check)")
+        vol_method = c8.selectbox(
+            "Vol estimate for edge check (1yr history)",
+            ["None (market IV only)", "Close-to-close (realized)", "GARCH(1,1) forecast", "EGARCH(1,1) forecast (asymmetric — weights recent down-moves more)"],
+        )
 
         submitted = st.form_submit_button("Analyze", type="primary")
 
@@ -449,12 +453,20 @@ def render_risk_tool(d: dict):
         return
 
     realized_or_forecast_vol = None
-    if use_realized:
+    if vol_method != "None (market IV only)":
         try:
             hist = fetch_price_history(ticker)
-            realized_or_forecast_vol = rv.close_to_close_vol(hist["close"])
+            log_returns = np.log(hist["close"] / hist["close"].shift(1)).dropna()
+            if vol_method == "Close-to-close (realized)":
+                realized_or_forecast_vol = rv.close_to_close_vol(hist["close"])
+            elif vol_method == "GARCH(1,1) forecast":
+                garch_fit = rv.fit_garch_11(log_returns)
+                realized_or_forecast_vol = rv.garch_forecast_vol(garch_fit, horizon_days=max(dte, 1))
+            else:
+                egarch_fit = rv.fit_egarch_11(log_returns)
+                realized_or_forecast_vol = rv.egarch_forecast_vol(egarch_fit, horizon_days=max(dte, 1))
         except Exception as exc:
-            st.warning(f"Couldn't compute realized vol ({exc}) — continuing with market IV only.")
+            st.warning(f"Couldn't compute {vol_method} ({exc}) — continuing with market IV only.")
 
     config = DEFAULT_CONFIG
     T = dte / 365.0
@@ -465,7 +477,7 @@ def render_risk_tool(d: dict):
         spread = realized_or_forecast_vol - market_iv
         c1, c2, c3 = st.columns(3)
         c1.metric("Market IV", f"{market_iv:.1%}")
-        c2.metric("Realized vol (close-to-close, 1yr)", f"{realized_or_forecast_vol:.1%}")
+        c2.metric(vol_method, f"{realized_or_forecast_vol:.1%}")
         c3.metric("Spread (realized − implied)", f"{spread:+.1%}")
         st.caption(
             "Positive spread = your realized vol exceeds market IV (options may be cheap relative to actual "
