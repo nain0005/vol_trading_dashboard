@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import pandas as pd
 
+from risk_tool.option_strategy import OptionLeg
+from risk_tool.portfolio_risk import Exposure, equity_stress_pl, option_leg_stress_pl
+
 
 def aggregate_greeks(option_positions: pd.DataFrame) -> dict:
     if option_positions.empty:
@@ -120,3 +123,107 @@ def held_contracts_in_chain(
         return held
 
     return held.merge(chain[["strike", "type", "iv", "spread", "spread_pct", "mid"]], on=["strike", "type"], how="left")
+
+
+def book_underlyings(equity_positions: pd.DataFrame, option_positions: pd.DataFrame) -> list[str]:
+    """Every distinct underlying symbol held, either as shares or as an
+    option -- the set of names a portfolio-level risk view (correlation,
+    VaR, stress test) needs price history for."""
+    symbols: set[str] = set()
+    if not equity_positions.empty:
+        symbols |= set(equity_positions["symbol"].dropna().unique())
+    if not option_positions.empty:
+        symbols |= set(option_positions["symbol"].dropna().unique())
+    return sorted(symbols)
+
+
+def book_exposures(
+    equity_positions: pd.DataFrame, option_positions: pd.DataFrame, spot_by_symbol: dict
+) -> list[Exposure]:
+    """Net dollar-delta Exposure per underlying, for risk_tool.portfolio_risk's
+    VaR functions.
+
+    Shares and options on the SAME underlying are netted into one Exposure
+    before returning -- e.g. long 100 shares of XOM plus short calls whose
+    delta offsets 40 of those shares nets to a 60-share-equivalent dollar
+    exposure, not two separate 100- and -40-share bets. Getting this netting
+    right is the entire point of a portfolio (rather than per-position) risk
+    view: it's what lets a covered call correctly show up as LESS risky than
+    the same amount of naked stock.
+
+    Symbols with no entry in spot_by_symbol are silently skipped (no price
+    to convert shares-equivalent into a dollar figure) rather than raising,
+    so one bad/delisted quote doesn't take down the whole portfolio view.
+    """
+    totals: dict[str, float] = {}
+
+    if not equity_positions.empty:
+        for _, row in equity_positions.iterrows():
+            spot = spot_by_symbol.get(row["symbol"])
+            if not spot:
+                continue
+            totals[row["symbol"]] = totals.get(row["symbol"], 0.0) + float(row["quantity"]) * spot
+
+    if not option_positions.empty:
+        net_delta_by_symbol = option_positions.groupby("symbol")["delta"].sum()  # already signed, multiplier-adjusted shares-equivalent
+        for symbol, net_delta_shares in net_delta_by_symbol.items():
+            spot = spot_by_symbol.get(symbol)
+            if not spot:
+                continue
+            totals[symbol] = totals.get(symbol, 0.0) + float(net_delta_shares) * spot
+
+    return [Exposure(symbol=s, dollar_delta=v) for s, v in totals.items() if abs(v) > 1e-9]
+
+
+def book_stress_pl(
+    equity_positions: pd.DataFrame,
+    option_positions: pd.DataFrame,
+    spot_by_symbol: dict,
+    shock_pct: float,
+    iv_shock_pts: float = 0.0,
+    r: float = 0.05,
+    q: float = 0.0,
+) -> dict:
+    """Full-repricing P&L of the whole book under one scenario: every
+    underlying's spot moves by shock_pct simultaneously (a market-wide
+    move, the standard stress-test scenario -- not a per-symbol shock),
+    and every option leg is repriced exactly via Black-Scholes rather than
+    approximated from today's Greeks (see
+    risk_tool.portfolio_risk.option_leg_stress_pl for why that matters for
+    a large move). Equity legs are exact by construction (linear payoff).
+
+    iv_shock_pts applies to every option leg's IV uniformly -- a real
+    selloff doesn't crush/expand every name's vol by the same number of
+    points, but a single shared shock keeps the scenario legible instead
+    of requiring a per-symbol vol view for a portfolio-wide stress test.
+
+    Positions on an underlying with no entry in spot_by_symbol, or an
+    option with a missing/non-positive DTE or IV, are skipped and counted
+    in `skipped` rather than silently dropped from the total unexplained.
+    """
+    equity_pl = 0.0
+    option_pl = 0.0
+    skipped = 0
+
+    if not equity_positions.empty:
+        for _, row in equity_positions.iterrows():
+            spot = spot_by_symbol.get(row["symbol"])
+            if not spot:
+                skipped += 1
+                continue
+            equity_pl += equity_stress_pl(float(row["quantity"]), spot, shock_pct)
+
+    if not option_positions.empty:
+        for _, row in option_positions.iterrows():
+            spot = spot_by_symbol.get(row["symbol"])
+            iv = row.get("implied_volatility")
+            dte = row.get("dte")
+            if not spot or iv is None or pd.isna(iv) or iv <= 0 or dte is None or pd.isna(dte):
+                skipped += 1
+                continue
+            contracts = float(row["quantity"]) if row["side"] == "long" else -float(row["quantity"])
+            leg = OptionLeg(option_type=row["type"], strike=float(row["strike"]), premium=float(row["avg_price"]), contracts=contracts, iv=float(iv))
+            T_years = max(float(dte), 0.0) / 365.0
+            option_pl += option_leg_stress_pl(leg, spot, T_years, shock_pct, iv_shock_pts=iv_shock_pts, r=r, q=q)
+
+    return {"equity_pl": equity_pl, "option_pl": option_pl, "total_pl": equity_pl + option_pl, "skipped": skipped}
