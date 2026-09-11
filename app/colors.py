@@ -25,3 +25,7 @@ INK_SECONDARY = "#52514e"
 INK_MUTED = "#898781"
 GRIDLINE = "#e1e0d9"
 SURFACE = "#fcfcfb"
+
+# UI chrome only (custom CSS in dashboard.py) — charts never use these two.
+SURFACE_RAISED = "#ffffff"  # card/metric-tile background, one step lighter than the page SURFACE for subtle elevation
+ACCENT_SOFT = "#eaf1fb"  # tint of CATEGORICAL[0] (the primary blue), for badges/active-tab backgrounds/hover states

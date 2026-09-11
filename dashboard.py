@@ -10,6 +10,7 @@ from app.auth import ensure_logged_in, is_demo_mode, logout
 from risk_tool import hedge
 from risk_tool import option_strategy
 from risk_tool import options_lab
+from risk_tool import portfolio_risk
 from risk_tool import realized_vol as rv
 from risk_tool import risk_manager
 from risk_tool import sizing as risk_sizing
@@ -23,6 +24,124 @@ else:
     from app import data_fetch
 
 st.set_page_config(page_title="Vol Trading Dashboard", page_icon="📉", layout="wide")
+
+
+def inject_custom_css():
+    """One CSS block, sourced entirely from app/colors.py tokens, that turns
+    the default Streamlit chrome into something closer to a real trading
+    terminal: a branded header, elevated metric tiles instead of bare
+    numbers, an underlined active-tab indicator, and a monospace/tabular
+    numeral face for anything that's actually a price or a Greek so columns
+    of numbers line up the way they would in a real quote screen.
+
+    Deliberately scoped to stable, widely-documented Streamlit selectors
+    (data-testid attributes, baseweb tab parts) rather than deep structural
+    hacks — those selectors have moved across major Streamlit versions
+    before and will again, so anything here breaking should degrade to
+    "looks like plain Streamlit," never to a broken layout.
+    """
+    st.markdown(
+        f"""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+        html, body, [class*="css"] {{
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }}
+
+        /* ---- App header ---- */
+        .vt-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.9rem 1.4rem;
+            margin: -1rem -1rem 1.2rem -1rem;
+            background: linear-gradient(135deg, {colors.INK_PRIMARY} 0%, #1c2f45 60%, {colors.CATEGORICAL[0]} 160%);
+            border-radius: 0 0 14px 14px;
+            box-shadow: 0 4px 18px rgba(0,0,0,0.12);
+        }}
+        .vt-header-left {{ display: flex; align-items: center; gap: 0.75rem; }}
+        .vt-header-icon {{ font-size: 1.9rem; line-height: 1; }}
+        .vt-header-title {{
+            color: #fdfdfc; font-size: 1.28rem; font-weight: 700; letter-spacing: 0.01em; margin: 0;
+        }}
+        .vt-header-subtitle {{
+            color: rgba(253,253,252,0.68); font-size: 0.8rem; font-weight: 400; margin: 0.1rem 0 0 0;
+        }}
+        .vt-header-badge {{
+            font-family: 'IBM Plex Mono', monospace; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.08em;
+            padding: 0.3rem 0.65rem; border-radius: 999px; text-transform: uppercase; white-space: nowrap;
+        }}
+        .vt-header-badge.live {{ background: rgba(12,163,12,0.18); color: #7be07b; border: 1px solid rgba(12,163,12,0.4); }}
+        .vt-header-badge.demo {{ background: rgba(250,178,25,0.18); color: #ffcf6b; border: 1px solid rgba(250,178,25,0.45); }}
+
+        /* ---- Metric tiles ---- */
+        [data-testid="stMetric"] {{
+            background: {colors.SURFACE_RAISED};
+            border: 1px solid {colors.GRIDLINE};
+            border-radius: 10px;
+            padding: 0.85rem 1rem 0.7rem 1rem;
+            box-shadow: 0 1px 2px rgba(11,11,11,0.04);
+            transition: border-color 0.15s ease;
+        }}
+        [data-testid="stMetric"]:hover {{ border-color: {colors.CATEGORICAL[0]}; }}
+        [data-testid="stMetricLabel"] {{
+            font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
+            color: {colors.INK_MUTED};
+        }}
+        [data-testid="stMetricValue"] {{
+            font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; font-weight: 600;
+            color: {colors.INK_PRIMARY};
+        }}
+        [data-testid="stMetricDelta"] {{ font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }}
+
+        /* ---- Tabs ---- */
+        .stTabs [data-baseweb="tab-list"] {{
+            gap: 0.2rem; border-bottom: 1px solid {colors.GRIDLINE};
+        }}
+        .stTabs [data-baseweb="tab"] {{
+            height: 2.4rem; padding: 0 0.9rem; font-weight: 500; font-size: 0.88rem; color: {colors.INK_SECONDARY};
+            border-radius: 8px 8px 0 0;
+        }}
+        .stTabs [data-baseweb="tab"]:hover {{ background: {colors.ACCENT_SOFT}; color: {colors.INK_PRIMARY}; }}
+        .stTabs [aria-selected="true"] {{ color: {colors.CATEGORICAL[0]} !important; font-weight: 600; }}
+        .stTabs [data-baseweb="tab-highlight"] {{ background-color: {colors.CATEGORICAL[0]}; height: 2.5px; }}
+
+        /* ---- Dataframes / tables: numeric alignment feel ---- */
+        [data-testid="stDataFrame"] {{ font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }}
+
+        /* ---- Expanders (methodology notes) ---- */
+        [data-testid="stExpander"] {{
+            border: 1px solid {colors.GRIDLINE}; border-radius: 10px; background: {colors.SURFACE_RAISED};
+        }}
+
+        /* ---- Buttons ---- */
+        .stButton button {{ border-radius: 8px; font-weight: 500; }}
+        .stButton button[kind="primary"] {{ background: {colors.CATEGORICAL[0]}; border-color: {colors.CATEGORICAL[0]}; }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_header(demo: bool):
+    badge_class = "demo" if demo else "live"
+    badge_text = "Demo mode" if demo else "Live · Robinhood"
+    st.markdown(
+        f"""
+        <div class="vt-header">
+            <div class="vt-header-left">
+                <span class="vt-header-icon">📉</span>
+                <div>
+                    <p class="vt-header-title">Vol Trading Dashboard</p>
+                    <p class="vt-header-subtitle">Options &amp; volatility book — positions, Greeks, portfolio risk, and execution in one place</p>
+                </div>
+            </div>
+            <span class="vt-header-badge {badge_class}">{badge_text}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -180,6 +299,229 @@ def render_vol_exposure(d: dict):
         st.caption("No direct positions in your configured vol-ETP list (see VOL_TICKERS in .env).")
     else:
         st.dataframe(vol_holdings, use_container_width=True, hide_index=True)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_spot_prices(symbols: tuple) -> dict:
+    prices = {}
+    for sym in symbols:
+        try:
+            prices[sym] = data_fetch.get_underlying_price(sym)
+        except Exception:
+            continue
+    return prices
+
+
+_STRESS_SHOCKS_PCT = [-0.20, -0.15, -0.10, -0.05, -0.02, 0.02, 0.05, 0.10, 0.15, 0.20]
+
+
+def render_portfolio_risk(d: dict):
+    st.subheader("Portfolio Risk")
+    st.caption(
+        "Correlation, Value-at-Risk, and stress tests across your WHOLE book at once. Every other tab looks at "
+        "one position or one underlying at a time; this is the only place that asks 'if everything moves "
+        "together, how much do I actually lose' — which is a different question from 'how risky is this one "
+        "trade,' and usually the more important one once a book has more than a couple of names in it."
+    )
+    eq, opt = d["equity_positions"], d["option_positions"]
+    underlyings = vol_analysis.book_underlyings(eq, opt)
+    if len(underlyings) < 1:
+        st.info("No open equity or option positions to analyze.")
+        return
+
+    with st.expander("Methodology / what this does and doesn't do", expanded=False):
+        st.markdown(
+            "- **Correlation/covariance** use daily log returns, inner-joined on date across every underlying "
+            "you hold — a name with a short price history (e.g. a recent listing) shrinks the usable window for "
+            "everyone, since a correlation matrix only means something if every pair is measured over the same "
+            "dates.\n"
+            "- **Net exposure** combines shares and option delta on the SAME underlying into one dollar figure "
+            "before anything downstream sees it — a covered call correctly shows up as less risky than the same "
+            "amount of naked stock, not as two unrelated bets.\n"
+            "- **Parametric (delta-normal) VaR** assumes returns are jointly normal and that P&L moves linearly "
+            "with each name's return (no gamma). Fast and smooth, but it understates tail risk for anything "
+            "convex (any option) and understates how correlations spike toward 1 in a real crash.\n"
+            "- **Historical VaR** replays your book's ACTUAL simulated P&L on each of the last N trading days — "
+            "real fat tails and real historical co-movement come through, but it's still a linear, delta-only "
+            "repricing per name, and it's only as good as the lookback window (a calm window understates risk; "
+            "a crash-era window overstates it for a calm market).\n"
+            "- **Neither VaR method captures options convexity for a large move.** That's what the stress test "
+            "below is for: it reprices every option leg exactly via Black-Scholes at the shocked spot/IV, at the "
+            "cost of only covering the specific scenarios you ask about instead of a continuous distribution.\n"
+            "- All of this is a **market-wide, single-shock scenario** (every underlying moves by the same % at "
+            "once) — it does not model one name gapping alone, or correlations breaking down, or your own "
+            "positions' delta/gamma changing as time passes before the shock hits."
+        )
+
+    spot_by_symbol = fetch_spot_prices(tuple(underlyings))
+    missing_spot = [s for s in underlyings if s not in spot_by_symbol]
+    if missing_spot:
+        st.warning(f"Couldn't get a live price for: {', '.join(missing_spot)} — excluded below.")
+
+    histories = {}
+    for sym in underlyings:
+        if sym not in spot_by_symbol:
+            continue
+        try:
+            hist = fetch_price_history(sym)
+            if not hist.empty:
+                histories[sym] = hist
+        except Exception:
+            continue
+
+    returns = portfolio_risk.align_returns(histories)
+    symbols_with_history = list(returns.columns)
+
+    exposures = vol_analysis.book_exposures(eq, opt, spot_by_symbol)
+    exposures_by_symbol = {e.symbol: e for e in exposures}
+
+    st.markdown("##### Net exposure by underlying")
+    st.caption("Shares and option delta on the same name netted together — dollar amount that moves 1:1 with a 100% move in that underlying.")
+    if not exposures:
+        st.caption("No net directional exposure (fully delta-neutral, or no positions priced).")
+    else:
+        exp_df = pd.DataFrame(
+            [{"symbol": e.symbol, "net dollar delta": e.dollar_delta} for e in sorted(exposures, key=lambda e: -abs(e.dollar_delta))]
+        )
+        st.dataframe(
+            exp_df, use_container_width=True, hide_index=True,
+            column_config={"net dollar delta": st.column_config.NumberColumn(format="$%,.0f")},
+        )
+
+    st.divider()
+    st.markdown("##### Correlation matrix (daily returns)")
+    if len(symbols_with_history) < 2:
+        st.caption("Need overlapping price history for at least 2 underlyings to build a correlation matrix.")
+    else:
+        corr = portfolio_risk.correlation_matrix(returns)
+        fig_corr = go.Figure(
+            data=go.Heatmap(
+                z=corr.values, x=corr.columns, y=corr.index,
+                colorscale=[[0, colors.DIVERGING_NEG], [0.5, colors.DIVERGING_MID], [1, colors.DIVERGING_POS]],
+                zmid=0, zmin=-1, zmax=1,
+                text=corr.round(2).values, texttemplate="%{text}",
+                colorbar=dict(title="corr"),
+                hovertemplate="%{y} vs %{x}<br>corr %{z:.2f}<extra></extra>",
+            )
+        )
+        fig_corr.update_layout(
+            height=max(280, 40 * len(corr)),
+            margin=dict(l=10, r=10, t=10, b=10),
+            plot_bgcolor=colors.SURFACE, paper_bgcolor=colors.SURFACE,
+            xaxis=dict(color=colors.INK_MUTED), yaxis=dict(color=colors.INK_MUTED, autorange="reversed"),
+        )
+        st.plotly_chart(fig_corr, use_container_width=True)
+        st.caption(f"{len(returns)} overlapping trading days used.")
+
+    st.divider()
+    st.markdown("##### Value-at-Risk")
+    var_exposures = [exposures_by_symbol[s] for s in symbols_with_history if s in exposures_by_symbol]
+    if len(var_exposures) < 1:
+        st.caption("No priced net exposure with overlapping return history — can't estimate VaR.")
+    else:
+        vc1, vc2 = st.columns(2)
+        confidence = vc1.select_slider("Confidence", options=[0.90, 0.95, 0.975, 0.99], value=0.95, key="var_confidence")
+        horizon_days = vc2.slider("Horizon (trading days)", min_value=1, max_value=20, value=1, key="var_horizon")
+
+        try:
+            param = portfolio_risk.parametric_var(var_exposures, returns, confidence=confidence, horizon_days=horizon_days)
+        except Exception as exc:
+            param = None
+            st.warning(f"Parametric VaR unavailable: {exc}")
+
+        hist_result, hist_pnl = None, None
+        try:
+            hist_result, hist_pnl = portfolio_risk.historical_var(var_exposures, returns, confidence=confidence, horizon_days=horizon_days)
+        except Exception as exc:
+            st.caption(f"Historical VaR unavailable ({exc}) — needs at least 20 overlapping trading days.")
+
+        m1, m2, m3, m4 = st.columns(4)
+        if param:
+            m1.metric(f"Parametric VaR ({confidence:.0%}, {horizon_days}d)", money(param.var_dollars))
+            m2.metric(
+                "Diversification ratio", f"{param.diversification_ratio:.0%}" if param.diversification_ratio is not None else "—",
+                help="VaR / sum of each name's standalone VaR. Below 100% means correlation is netting risk down across your book; at/near 100% means your positions are effectively one correlated bet.",
+            )
+        if hist_result:
+            m3.metric(f"Historical VaR ({confidence:.0%}, {horizon_days}d)", money(hist_result.var_dollars))
+            ov_equity = d["overview"].get("equity") if d.get("overview") else None
+            if ov_equity:
+                m4.metric("Historical VaR, % of equity", f"{hist_result.var_dollars / ov_equity:.1%}")
+
+        if hist_pnl is not None and not hist_pnl.empty:
+            fig_hist = go.Figure()
+            fig_hist.add_trace(
+                go.Histogram(x=hist_pnl, marker_color=colors.CATEGORICAL[0], nbinsx=30, hovertemplate="P&L $%{x:,.0f}<extra></extra>")
+            )
+            if hist_result:
+                fig_hist.add_vline(x=-hist_result.var_dollars, line=dict(color=colors.STATUS_CRITICAL, dash="dash", width=2), annotation_text=f"{confidence:.0%} VaR")
+            fig_hist.update_layout(
+                height=260,
+                margin=dict(l=10, r=10, t=10, b=10),
+                plot_bgcolor=colors.SURFACE, paper_bgcolor=colors.SURFACE,
+                xaxis=dict(title="Simulated 1-day book P&L ($)", color=colors.INK_MUTED),
+                yaxis=dict(showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED, title="Days"),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+            st.caption("Histogram of what your CURRENT book would have made/lost on each of the last N trading days, at today's exposures.")
+
+    st.divider()
+    st.markdown("##### Stress test — market-wide shock")
+    st.caption(
+        "Every underlying moves by the same % at once; every option leg is fully repriced via Black-Scholes "
+        "(not a linear Greeks approximation) at the shocked spot and IV."
+    )
+    sc1, sc2 = st.columns(2)
+    vol_pts_per_10pct_down = sc1.slider(
+        "IV expansion on down moves (points per 10% the market drops)", min_value=0.0, max_value=15.0, value=4.0, step=0.5,
+        help="Applied only to negative shocks — vol reliably rises in selloffs (the 'leverage effect' also discussed in the Risk Tool's EGARCH model), so a flat-IV down-move scenario is optimistic. Up moves are left at flat IV by default since post-selloff vol relief isn't nearly as reliable.",
+    )
+    config = DEFAULT_CONFIG
+
+    rows = []
+    total_skipped = 0
+    for shock in _STRESS_SHOCKS_PCT:
+        iv_shock = vol_pts_per_10pct_down * max(0.0, -shock) / 0.10
+        result = vol_analysis.book_stress_pl(eq, opt, spot_by_symbol, shock, iv_shock_pts=iv_shock, r=config.risk_free_rate, q=config.dividend_yield)
+        total_skipped = max(total_skipped, result["skipped"])
+        rows.append(
+            {
+                "market move": shock, "IV shock (pts)": iv_shock,
+                "equity P&L": result["equity_pl"], "option P&L": result["option_pl"], "total P&L": result["total_pl"],
+            }
+        )
+    stress_df = pd.DataFrame(rows)
+
+    fig_stress = go.Figure()
+    bar_colors = [colors.DIVERGING_NEG if v < 0 else colors.DIVERGING_POS for v in stress_df["total P&L"]]
+    fig_stress.add_trace(
+        go.Bar(
+            x=[f"{v:+.0%}" for v in stress_df["market move"]], y=stress_df["total P&L"], marker_color=bar_colors,
+            hovertemplate="%{x}<br>Total P&L $%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig_stress.update_layout(
+        height=300,
+        margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor=colors.SURFACE, paper_bgcolor=colors.SURFACE,
+        xaxis=dict(title="Market move", showgrid=False, color=colors.INK_MUTED),
+        yaxis=dict(title="Total book P&L ($)", showgrid=True, gridcolor=colors.GRIDLINE, zerolinecolor=colors.INK_MUTED, color=colors.INK_MUTED),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_stress, use_container_width=True)
+    st.dataframe(
+        stress_df, use_container_width=True, hide_index=True,
+        column_config={
+            "market move": st.column_config.NumberColumn(format="percent"),
+            "IV shock (pts)": st.column_config.NumberColumn(format="%.1f"),
+            "equity P&L": st.column_config.NumberColumn(format="$%,.0f"),
+            "option P&L": st.column_config.NumberColumn(format="$%,.0f"),
+            "total P&L": st.column_config.NumberColumn(format="$%,.0f"),
+        },
+    )
+    if total_skipped:
+        st.caption(f"{total_skipped} position(s) skipped in the stress test (missing live price, IV, or DTE).")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1609,7 +1951,8 @@ def render_win_rate(d: dict):
 
 
 def main():
-    st.title("📉 Vol Trading Dashboard")
+    inject_custom_css()
+    render_header(demo=is_demo_mode())
 
     if is_demo_mode():
         st.info(
@@ -1637,8 +1980,9 @@ def main():
 
     tabs = st.tabs(
         [
-            "Overview", "Positions & Greeks", "Vol Exposure", "Vol Skew", "Risk Tool", "Spread Selector",
-            "Strategy Payoff", "Options Lab", "Delta Hedge", "Orders & History", "Win Rate", "Journal / Export",
+            "Overview", "Positions & Greeks", "Vol Exposure", "Portfolio Risk", "Vol Skew", "Risk Tool",
+            "Spread Selector", "Strategy Payoff", "Options Lab", "Delta Hedge", "Orders & History", "Win Rate",
+            "Journal / Export",
         ]
     )
     with tabs[0]:
@@ -1648,24 +1992,26 @@ def main():
     with tabs[2]:
         render_vol_exposure(d)
     with tabs[3]:
-        render_vol_skew(d)
+        render_portfolio_risk(d)
     with tabs[4]:
+        render_vol_skew(d)
+    with tabs[5]:
         render_risk_tool(d)
         st.divider()
         render_position_monitor(d)
-    with tabs[5]:
-        render_spread_selector(d)
     with tabs[6]:
-        render_strategy_payoff(d)
+        render_spread_selector(d)
     with tabs[7]:
-        render_options_lab(d)
+        render_strategy_payoff(d)
     with tabs[8]:
-        render_delta_hedge(d)
+        render_options_lab(d)
     with tabs[9]:
-        render_orders(d)
+        render_delta_hedge(d)
     with tabs[10]:
-        render_win_rate(d)
+        render_orders(d)
     with tabs[11]:
+        render_win_rate(d)
+    with tabs[12]:
         render_journal(d)
 
 
