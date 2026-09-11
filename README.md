@@ -24,12 +24,14 @@ A few things this codebase is meant to show, for anyone skimming it:
   open positions (`risk_tool/risk_manager.py`), and portfolio-level delta/vega
   governors that can halt new entries.
 - **Statistics applied correctly, not just called** — GARCH/EGARCH vol
-  forecasting fit by maximum likelihood (`risk_tool/realized_vol.py`), and a
+  forecasting fit by maximum likelihood (`risk_tool/realized_vol.py`), a
   beta-hedge calculator (`risk_tool/hedge.py`) that separates price-level
   correlation (inflated by shared trend) from return correlation (the honest
-  co-movement signal), sized off delta-adjusted exposure rather than notional.
+  co-movement signal), and portfolio-level delta-normal + historical
+  Value-at-Risk with full Black-Scholes stress-test repricing
+  (`risk_tool/portfolio_risk.py`).
 - **Test discipline** — the entire `risk_tool/` package is pure, dependency-injected,
-  and independently pytest-covered (122 passing cases: `pytest tests/ -v`) —
+  and independently pytest-covered (213 passing cases: `pytest tests/ -v`) —
   it's also usable as a standalone CLI with no Streamlit/Robinhood dependency
   at all (`python3 -m risk_tool.cli --help`).
 - **Production-adjacent app structure** — Robinhood I/O is fully isolated from
@@ -45,25 +47,43 @@ A few things this codebase is meant to show, for anyone skimming it:
 - **Vol Exposure** — book-level net delta/theta/vega/gamma, vega & theta
   broken down by underlying, and your VIX-ETP holdings (VXX/UVXY/SVXY/etc.,
   configurable) with live quotes.
+- **Portfolio Risk** — cross-position risk the other tabs don't answer: net
+  dollar exposure per underlying (shares netted against option delta so a
+  covered call correctly reads as less risky than naked stock), a
+  return-correlation heatmap across everything you hold, side-by-side
+  parametric (delta-normal) and historical Value-at-Risk with a simulated
+  daily P&L histogram, and a market-wide stress test that fully reprices
+  every option leg via Black-Scholes at a shocked spot/IV (not a linear
+  Greeks approximation) across a range of preset market moves.
 - **Vol Skew** — live IV-by-strike and bid/ask-spread-by-strike for any
-  underlying/expiration, with your held contracts marked on both charts.
+  underlying/expiration (with your held contracts marked on both charts),
+  plus a term-structure view: ATM IV across expirations vs. trailing
+  20d/60d realized vol.
 - **Risk Tool** — strike selection by expected value, Kelly-based position
   sizing with a non-overridable hard cap, pre-committed entry/exit levels,
   and a live monitor that runs exit rules against your actual open
   positions. Does not predict direction — see `risk_tool/README.md` for the
   full model-by-model writeup (math, assumptions, limitations). Also usable
   standalone: `python3 -m risk_tool.cli --help`.
-- **Correlation Explorer** — cumulative-return chart and price-level/return
-  correlation for any two symbols you type in.
-- **Hedge Calculator** — sizes a beta-hedge (shares or futures) for a shares
-  or options position against any correlated instrument, with beta estimated
+- **Spread Selector** — ranks real, listed strikes for bear put spreads, bull
+  put spreads, straddles, and strangles against your own realized/GARCH/
+  EGARCH vol view (edge EV), not just risk:reward.
+- **Strategy Payoff** — exact max profit/loss/breakeven(s) for any multi-leg
+  combination of calls/puts you build by hand, plus a live mark-to-market
+  curve.
+- **Options Lab** — P&L surface (spot × time), Greeks sensitivity curves,
+  and an earnings/IV-crush simulator for any structure — build one from
+  scratch, import an open position, or send one over from the Spread
+  Selector or Strategy Payoff tabs.
+- **Delta Hedge** — sizes a beta-hedge (shares or futures) for a shares or
+  options position against any correlated instrument, with beta estimated
   live from price history, plus a movable P&L scenario chart (drag to any
   bearish or bullish move) for the resulting hedged position.
 - **Orders & History** — open orders and recent fills.
-- **Win Rate** — realized round-trip trades FIFO-matched from your fill history, with win rate, avg
-  win/loss, profit factor, a cumulative realized-P&L chart, and a breakdown by equity vs. options.
-  Equity matching is exact; options are matched per underlying symbol only (fill history has no
-  per-contract identity) — see the caveat in the tab itself.
+- **Win Rate** — realized round-trip trades FIFO-matched from your fill history (matched per exact
+  option contract, not just underlying symbol, so two different contracts on the same underlying
+  held at once can't cross-match), with win rate, avg win/loss, profit factor, a cumulative
+  realized-P&L chart, and a breakdown by equity vs. options.
 - **Journal / Export** — normalized trade log with a CSV download button
   (and an option to save a timestamped copy into `exports/`).
 
@@ -120,9 +140,10 @@ Robinhood account — see Notes/limitations below for why.
   dedicated exposure view — edit it to match what you actually trade.
 - Robinhood's API doesn't expose the raw VIX index quote, so vol-ETP tracking
   uses the ETPs themselves (VXX, UVXY, etc.) as the proxy, not `^VIX` directly.
-- The trade journal covers **filled** orders from the last 90 days by default
-  (`data_fetch.get_order_history(days_back=...)`); increase that if you want
-  a longer lookback.
+- The trade journal covers **filled** orders from the last ~10 years by
+  default (`data_fetch.get_order_history(days_back=3650)`) — effectively
+  all-time for any real account; pass a smaller `days_back` if you want a
+  shorter window.
 - This is a personal-use tool with no auth layer of its own — don't expose
   `streamlit run` beyond `localhost` (e.g. don't tunnel it to the public
   internet) since it holds your live Robinhood session.
@@ -133,11 +154,14 @@ Robinhood account — see Notes/limitations below for why.
 dashboard.py           Streamlit entrypoint / UI
 app/auth.py            Robinhood login (+ MFA) handling
 app/data_fetch.py      All robin_stocks calls, returned as plain DataFrames
-app/vol_analysis.py    Greeks aggregation, vega/theta by underlying, expiry checks, cross-symbol correlation
+app/vol_analysis.py    Greeks aggregation, vega/theta by underlying, expiry checks, cross-symbol
+                        correlation, portfolio exposure netting + stress-test aggregation
 app/journal.py         Trade journal normalization + CSV export
-app/performance.py     FIFO round-trip trade matching + win-rate stats
-app/colors.py          Shared chart color tokens
-risk_tool/             Pricing, Greeks, strike selection, sizing, exit rules, beta-hedge sizing — see risk_tool/README.md
-tests/                 pytest suite for risk_tool (run: pytest tests/ -v)
+app/performance.py     FIFO round-trip trade matching + win-rate stats (per exact contract)
+app/colors.py          Shared chart/UI color tokens (also drives dashboard.py's custom CSS)
+risk_tool/             Pricing, Greeks, strike selection, sizing, exit rules, beta-hedge sizing,
+                        multi-leg strategy payoff, spread selection, options lab, portfolio-level
+                        VaR/stress testing — see risk_tool/README.md
+tests/                 pytest suite (run: pytest tests/ -v)
 exports/               CSV journal exports land here (gitignored)
 ```

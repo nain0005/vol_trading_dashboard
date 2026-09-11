@@ -7,16 +7,17 @@ timeframe); this tool prices it, sizes it, and holds you to your own exit
 rules.
 
 Every module is pure Python with no UI/network dependency — `pricing.py`,
-`greeks.py`, `strike_selection.py`, `sizing.py`, `risk_manager.py`, and
-`realized_vol.py` all run on manual inputs and are independently unit
-tested (see `../tests/`). `ibkr_client.py` and the Robinhood-backed
-dashboard tab are optional data sources layered on top.
+`greeks.py`, `strike_selection.py`, `sizing.py`, `risk_manager.py`,
+`realized_vol.py`, `hedge.py`, `option_strategy.py`, `spread_selection.py`,
+`options_lab.py`, and `portfolio_risk.py` all run on manual inputs and are
+independently unit tested (see `../tests/`). `ibkr_client.py` and the
+Robinhood-backed dashboard tabs are optional data sources layered on top.
 
 ## Quickstart
 
 ```bash
 # from the vol-dashboard/ directory, with .venv activated
-python3 -m pytest tests/ -v          # 87 tests as of this writing
+python3 -m pytest tests/ -v          # 213 tests as of this writing
 
 python3 -m risk_tool.cli \
   --ticker AAPL --spot 190 --iv 0.32 --dte 30 \
@@ -170,10 +171,35 @@ likelihood on demeaned returns, `σ²_t = ω + α·r²_{t-1} + β·σ²_{t-1}`,
 constrained to `α+β < 1` for stationarity. The forecast mean-reverts
 geometrically toward the long-run variance `ω/(1-α-β)` as the horizon
 grows — GARCH's answer to "how volatile eventually" is just the
-unconditional variance, regardless of today's conditions. This is a
-genuinely simple GARCH implementation (no leverage/asymmetry terms, no
-fat-tailed innovations) — treat it as one more vol estimate to feed
-`strike_selection.py`, not a research-grade volatility model.
+unconditional variance, regardless of today's conditions. Symmetric: an
+up move and a down move of the same size raise the forecast by the same
+amount.
+
+**EGARCH(1,1)** (`fit_egarch_11`, `egarch_forecast_vol`): adds the
+"leverage effect" — equity vol empirically rises more after a down move
+than an up move of the same size — via an asymmetry term `γ`, modeling
+log-variance directly (`ln σ²_t = ω + β·ln σ²_{t-1} + α(|z_{t-1}|-E|z|) +
+γ·z_{t-1}`) so `ω`, `α`, `γ` need no positivity constraints, only `|β|<1`.
+A fitted `γ < 0` is the asymmetry the model exists to capture; a fitted `ν`
+below ~10 under `dist="t"` is a diagnostic that fat tails matter for that
+name. Both GARCH and EGARCH accept `dist="t"` innovations as an
+alternative to the normal default.
+
+### 6. Portfolio risk (`portfolio_risk.py`)
+
+Everything above describes ONE position or ONE underlying. This module
+answers the book-level question instead: correlation/covariance across
+every underlying held (`correlation_matrix`, `covariance_matrix`, on
+date-aligned daily log returns), delta-normal variance-covariance VaR
+(`parametric_var` — `w^T Σ w` linearized around today's net dollar delta
+per name) and historical-simulation VaR (`historical_var` — replays each
+day's actual joint return against today's exposures, so real fat tails and
+real historical co-movement come through without a normality assumption),
+and market-wide stress tests that fully reprice every option leg via
+Black-Scholes at a shocked spot/IV (`option_leg_stress_pl`) rather than
+linearizing — the one place here that captures gamma/vega convexity for a
+large move. See the dashboard's **Portfolio Risk** tab, or the module
+docstring for the full tradeoffs between the two VaR methods.
 
 ## Architecture notes
 
