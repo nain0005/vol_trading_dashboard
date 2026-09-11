@@ -188,8 +188,15 @@ def get_open_orders() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def get_order_history(days_back: int = 90) -> pd.DataFrame:
-    """Normalized fill history across equities + options, for the journal."""
+def get_order_history(days_back: int = 3650) -> pd.DataFrame:
+    """Normalized fill history across equities + options, for the journal.
+
+    days_back defaults to ~10 years (effectively "all time" for any real
+    account) rather than a short recent window -- Robinhood's underlying
+    get_all_stock_orders/get_all_option_orders calls already return your
+    full history unbounded; this filter only trims what's shown, so there's
+    no reason to default it short and hide older round trips from win-rate
+    stats."""
     equity_orders = rh.orders.get_all_stock_orders() or []
     option_orders = rh.orders.get_all_option_orders() or []
 
@@ -210,6 +217,7 @@ def get_order_history(days_back: int = 90) -> pd.DataFrame:
                 "date": created,
                 "instrument_type": "equity",
                 "symbol": symbol,
+                "contract_id": symbol,  # every equity fill on a symbol is the same instrument
                 "side": o.get("side"),
                 "quantity": qty,
                 "price": avg_price,
@@ -226,14 +234,28 @@ def get_order_history(days_back: int = 90) -> pd.DataFrame:
         if pd.isna(created) or created < cutoff:
             continue
         qty = _safe_float(o.get("processed_quantity") or o.get("quantity"))
-        avg_price = _safe_float(o.get("processed_premium") or o.get("price"))
+        # `price` is per-share premium (e.g. 2.18); `processed_premium` is the
+        # TOTAL dollar amount for the whole fill (price * qty * 100) -- using
+        # it as a per-share price here inflated realized P&L by ~qty*100x.
+        # Only fall back to processed_premium (normalized back to per-share)
+        # when `price` itself is missing.
+        avg_price = _safe_float(o.get("price"))
+        if not avg_price and qty:
+            avg_price = _safe_float(o.get("processed_premium")) / (qty * 100)
         legs = o.get("legs") or [{}]
         opening = (o.get("opening_strategy") or "").strip() != ""
+        # legs[0]['option'] is a per-contract instrument URL -- unique per
+        # (underlying, strike, expiration, type), unlike chain_symbol which
+        # is shared by every contract on the same underlying. Without this,
+        # match_round_trips FIFO-matches fills across DIFFERENT contracts
+        # whenever you hold more than one on the same underlying at once.
+        contract_id = (legs[0].get("option") if legs else None) or o.get("chain_symbol")
         rows.append(
             {
                 "date": created,
                 "instrument_type": "option",
                 "symbol": o.get("chain_symbol"),
+                "contract_id": contract_id,
                 "side": legs[0].get("side") if legs else o.get("direction"),
                 "quantity": qty,
                 "price": avg_price,
@@ -342,12 +364,44 @@ def get_equity_historicals(symbol: str, interval: str = "day", span: str = "year
             "close": _safe_float(bar.get("close_price")),
         }
         for bar in bars
+        if bar  # an unrecognized symbol returns [None] rather than [] or raising
     ]
     df = pd.DataFrame(rows)
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values("date").reset_index(drop=True)
+
+
+def get_crypto_historicals(symbol: str, interval: str = "day", span: str = "year") -> pd.DataFrame:
+    """Same shape as get_equity_historicals, for crypto hedge instruments
+    (e.g. XLM) that aren't on the equities historicals endpoint. Crypto
+    trades 24/7 so bounds is fixed at '24_7' rather than 'regular'."""
+    bars = rh.crypto.get_crypto_historicals(symbol, interval=interval, span=span, bounds="24_7") or []
+    rows = [
+        {
+            "date": bar.get("begins_at"),
+            "open": _safe_float(bar.get("open_price")),
+            "high": _safe_float(bar.get("high_price")),
+            "low": _safe_float(bar.get("low_price")),
+            "close": _safe_float(bar.get("close_price")),
+        }
+        for bar in bars
+        if bar
+    ]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def get_crypto_quote(symbol: str) -> dict:
+    q = rh.crypto.get_crypto_quote(symbol) or {}
+    bid = _safe_float(q.get("bid_price"))
+    ask = _safe_float(q.get("ask_price"))
+    mark = _safe_float(q.get("mark_price")) or ((bid + ask) / 2 if bid and ask else 0.0)
+    return {"symbol": q.get("symbol", symbol), "bid": bid, "ask": ask, "mark": mark, "last_trade_price": mark}
 
 
 def get_vol_ticker_quotes() -> pd.DataFrame:

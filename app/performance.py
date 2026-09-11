@@ -1,19 +1,20 @@
 """Realized round-trip trade matching + win-rate stats, built from
 data_fetch.get_order_history's fill log.
 
-FIFO-matches each symbol's chronological buy/sell fills into closed
-round-trip trades (long: buy-then-sell; short: sell-then-buy) -- the same
-mechanics a broker's own realized-P&L accounting uses, so partial fills
-and re-entries net out correctly. Options carry the standard 100-share
-contract multiplier; equities don't.
+FIFO-matches each (symbol, contract) group's chronological buy/sell fills
+into closed round-trip trades (long: buy-then-sell; short: sell-then-buy)
+-- the same mechanics a broker's own realized-P&L accounting uses, so
+partial fills and re-entries net out correctly. Options carry the
+standard 100-share contract multiplier; equities don't.
 
-Known limitation, not fixable from data currently pulled: Robinhood's
-fill history exposes only the underlying symbol for options, not a
-per-contract strike/expiration/type identity (only *open positions* carry
-that). So options are matched per-underlying-symbol -- if you hold
-multiple different contracts on the same underlying concurrently, fills
-across them can get cross-matched. Equity matching has no such ambiguity
-and is exact.
+Matched per exact contract, not just underlying symbol: data_fetch's
+get_order_history() pulls each option fill's `legs[0]['option']`
+instrument URL as `contract_id` -- unique per (underlying, strike,
+expiration, type), unlike the chain symbol which every contract on the
+same underlying shares. If you hold two different contracts on the same
+underlying at once, they're matched independently and can't cross-match.
+(order_history without a contract_id column -- e.g. hand-built test
+fixtures -- falls back to symbol-only grouping.)
 """
 from __future__ import annotations
 
@@ -47,14 +48,20 @@ class RoundTrip:
 
 
 def match_round_trips(order_history: pd.DataFrame) -> list[RoundTrip]:
-    """Chronological FIFO match per (symbol, instrument_type) group. A buy
-    first closes any open short lots (oldest first), then opens/adds to a
-    long lot with whatever quantity is left over; a sell is the mirror."""
+    """Chronological FIFO match per (symbol, instrument_type, contract) group.
+    A buy first closes any open short lots (oldest first), then opens/adds
+    to a long lot with whatever quantity is left over; a sell is the
+    mirror."""
     if order_history.empty:
         return []
 
+    group_cols = ["symbol", "instrument_type"]
+    if "contract_id" in order_history.columns:
+        group_cols.append("contract_id")
+
     trips: list[RoundTrip] = []
-    for (symbol, instrument_type), group in order_history.groupby(["symbol", "instrument_type"]):
+    for group_key, group in order_history.groupby(group_cols):
+        symbol, instrument_type = group_key[0], group_key[1]
         multiplier = _CONTRACT_MULTIPLIER.get(instrument_type, 1)
         long_lots: deque[_Lot] = deque()
         short_lots: deque[_Lot] = deque()

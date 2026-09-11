@@ -7,8 +7,11 @@ import pytest
 from app.performance import match_round_trips, round_trips_to_frame, win_rate_by_instrument_type, win_rate_stats
 
 
-def fill(date, symbol, side, qty, price, instrument_type="equity"):
-    return {"date": pd.Timestamp(date, tz="UTC"), "symbol": symbol, "instrument_type": instrument_type, "side": side, "quantity": qty, "price": price}
+def fill(date, symbol, side, qty, price, instrument_type="equity", contract_id=None):
+    row = {"date": pd.Timestamp(date, tz="UTC"), "symbol": symbol, "instrument_type": instrument_type, "side": side, "quantity": qty, "price": price}
+    if contract_id is not None:
+        row["contract_id"] = contract_id
+    return row
 
 
 def frame(*fills):
@@ -96,6 +99,37 @@ class TestMatchRoundTrips:
     def test_unmatched_open_position_produces_no_trip(self):
         hist = frame(fill("2026-01-01", "AAPL", "buy", 10, 100.0))
         assert match_round_trips(hist) == []
+
+    def test_two_different_contracts_on_same_underlying_do_not_cross_match(self):
+        # Two different AAPL option contracts (different strikes) with
+        # OVERLAPPING open windows -- exactly the scenario that corrupted
+        # results before contract_id-based grouping existed. Contract A is
+        # a clean winner, contract B a clean loser; if they were wrongly
+        # matched together (old symbol-only behavior) the fills would pair
+        # up in fill order instead, producing different trips/P&L.
+        hist = frame(
+            fill("2026-01-01", "AAPL", "buy", 5, 2.00, instrument_type="option", contract_id="AAPL-150C"),
+            fill("2026-01-02", "AAPL", "buy", 5, 9.00, instrument_type="option", contract_id="AAPL-160C"),
+            fill("2026-01-03", "AAPL", "sell", 5, 3.00, instrument_type="option", contract_id="AAPL-150C"),  # A: win
+            fill("2026-01-04", "AAPL", "sell", 5, 8.00, instrument_type="option", contract_id="AAPL-160C"),  # B: loss
+        )
+        trips = match_round_trips(hist)
+        assert len(trips) == 2
+        by_contract = {t.entry_price: t for t in trips}
+        assert by_contract[2.00].exit_price == pytest.approx(3.00)  # A matched with A, not B
+        assert by_contract[2.00].is_win is True
+        assert by_contract[9.00].exit_price == pytest.approx(8.00)  # B matched with B, not A
+        assert by_contract[9.00].is_win is False
+
+    def test_missing_contract_id_column_falls_back_to_symbol_only_grouping(self):
+        # No contract_id column at all (e.g. an older cached order_history) --
+        # must not KeyError, and behaves like the pre-fix symbol-only match.
+        hist = frame(
+            fill("2026-01-01", "AAPL", "buy", 10, 100.0, instrument_type="option"),
+            fill("2026-01-05", "AAPL", "sell", 10, 110.0, instrument_type="option"),
+        )
+        trips = match_round_trips(hist)
+        assert len(trips) == 1
 
 
 class TestWinRateStats:

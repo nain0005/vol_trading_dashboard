@@ -91,6 +91,14 @@ def get_equity_historicals(symbol: str, interval: str = "day", span: str = "year
     return _price_series(symbol, n_days=n_days)
 
 
+def get_crypto_historicals(symbol: str, interval: str = "day", span: str = "year") -> pd.DataFrame:
+    return get_equity_historicals(symbol, interval=interval, span=span)
+
+
+def get_crypto_quote(symbol: str) -> dict:
+    return get_stock_quote(symbol)
+
+
 def get_portfolio_overview() -> dict:
     equity = 128_450.32
     prev_equity = 127_209.77
@@ -203,7 +211,7 @@ def get_open_orders() -> pd.DataFrame:
     )
 
 
-def get_order_history(days_back: int = 90) -> pd.DataFrame:
+def get_order_history(days_back: int = 3650) -> pd.DataFrame:
     rng = np.random.default_rng(_seed("order_history", str(days_back)))
     symbols = ["XOM", "AAPL", "TSLA", "MSFT", "SPY"]
     rows = []
@@ -212,8 +220,9 @@ def get_order_history(days_back: int = 90) -> pd.DataFrame:
 
     for i in range(18):
         symbol = symbols[i % len(symbols)]
+        contract_id = f"{symbol}-{i}"  # distinct per synthetic position, same schema as real contract_id
         is_option = bool(rng.integers(0, 2))
-        days_ago_open = int(rng.uniform(5, days_back))
+        days_ago_open = int(rng.uniform(5, min(days_back, 180)))
         entry_price = get_underlying_price(symbol) * float(rng.uniform(0.85, 1.15))
         qty = float(rng.integers(1, 10)) if is_option else float(rng.integers(10, 200))
         move = float(rng.normal(0.01, 0.06))
@@ -225,13 +234,13 @@ def get_order_history(days_back: int = 90) -> pd.DataFrame:
 
         rows.append({
             "date": open_date, "instrument_type": "option" if is_option else "equity", "symbol": symbol,
-            "side": "buy", "quantity": qty, "price": entry_price,
+            "contract_id": contract_id, "side": "buy", "quantity": qty, "price": entry_price,
             "amount": -qty * entry_price * multiplier, "fees": 0.0, "order_id": str(order_id),
             **({"strategy": "opening"} if is_option else {}),
         })
         rows.append({
             "date": close_date, "instrument_type": "option" if is_option else "equity", "symbol": symbol,
-            "side": "sell", "quantity": qty, "price": exit_price,
+            "contract_id": contract_id, "side": "sell", "quantity": qty, "price": exit_price,
             "amount": qty * exit_price * multiplier, "fees": 0.0, "order_id": str(order_id + 1),
             **({"strategy": "closing"} if is_option else {}),
         })

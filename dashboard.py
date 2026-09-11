@@ -1,3 +1,4 @@
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -6,10 +7,13 @@ import streamlit as st
 
 from app import colors, journal, performance, vol_analysis
 from app.auth import ensure_logged_in, is_demo_mode, logout
+from risk_tool import hedge
 from risk_tool import option_strategy
+from risk_tool import options_lab
 from risk_tool import realized_vol as rv
 from risk_tool import risk_manager
 from risk_tool import sizing as risk_sizing
+from risk_tool import spread_selection
 from risk_tool import strike_selection
 from risk_tool.config import DEFAULT_CONFIG, RiskConfig
 
@@ -361,10 +365,107 @@ def render_vol_skew(d: dict):
         },
     )
 
+    st.divider()
+    render_term_structure(symbol, expirations, spot)
+
 
 @st.cache_data(ttl=3600, show_spinner="Pulling price history...")
 def fetch_price_history(symbol: str):
     return data_fetch.get_equity_historicals(symbol)
+
+
+def render_term_structure(symbol: str, expirations: list, spot: float):
+    """ATM IV across expirations, benchmarked against trailing realized vol.
+
+    Reuses fetch_chain (already cached) per expiration rather than a new data
+    source — expensive part is one full chain fetch per expiration, so this
+    is opt-in via a button/slider instead of running on every page load.
+    """
+    st.markdown("##### Term structure & IV vs. realized vol")
+    st.caption(
+        "ATM implied vol across expirations. Upward slope (contango) is the normal state; "
+        "a front-month hump (backwardation) usually flags event risk (earnings, macro print) priced into "
+        "the near-dated options. Dotted lines are trailing realized vol — where ATM IV sits above them, "
+        "options are pricing more movement than has actually occurred recently."
+    )
+
+    max_available = min(12, len(expirations))
+    n = st.slider(
+        "Expirations to include", min_value=min(3, max_available), max_value=max_available,
+        value=min(6, max_available), key="term_structure_n",
+    )
+    if st.button("Load term structure", key="load_term_structure"):
+        today = date.today()
+        rows = []
+        for exp in expirations[:n]:
+            try:
+                chain = fetch_chain(symbol, exp)
+            except Exception:
+                continue
+            if chain.empty:
+                continue
+            metrics = vol_analysis.skew_metrics(chain, spot)
+            if metrics["atm_iv"] is None:
+                continue
+            dte = (pd.Timestamp(exp).date() - today).days
+            rows.append({"expiration": exp, "dte": max(dte, 0), "atm_iv": metrics["atm_iv"]})
+        st.session_state["term_structure_data"] = pd.DataFrame(rows)
+        st.session_state["term_structure_symbol"] = symbol
+
+    ts = st.session_state.get("term_structure_data")
+    if ts is None or ts.empty or st.session_state.get("term_structure_symbol") != symbol:
+        st.caption("Click **Load term structure** to pull ATM IV across the selected expirations.")
+        return
+
+    rv_20 = rv_60 = None
+    try:
+        hist = fetch_price_history(symbol)
+        if not hist.empty:
+            if len(hist) >= 21:
+                rv_20 = rv.close_to_close_vol(hist["close"].tail(21))
+            if len(hist) >= 61:
+                rv_60 = rv.close_to_close_vol(hist["close"].tail(61))
+    except Exception:
+        pass
+
+    ts = ts.sort_values("dte")
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=ts["dte"], y=ts["atm_iv"], mode="lines+markers", name="ATM IV",
+            line=dict(color=colors.CATEGORICAL[0], width=2), marker=dict(size=8),
+            customdata=ts["expiration"],
+            hovertemplate="%{customdata}<br>DTE %{x}<br>ATM IV %{y:.1%}<extra></extra>",
+        )
+    )
+    if rv_20 is not None:
+        fig.add_hline(
+            y=rv_20, line=dict(color=colors.STATUS_GOOD, dash="dot", width=1.5),
+            annotation_text="20d realized", annotation_position="right",
+        )
+    if rv_60 is not None:
+        fig.add_hline(
+            y=rv_60, line=dict(color=colors.INK_MUTED, dash="dot", width=1.5),
+            annotation_text="60d realized", annotation_position="right",
+        )
+    fig.update_layout(
+        height=340,
+        margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor=colors.SURFACE,
+        paper_bgcolor=colors.SURFACE,
+        xaxis=dict(title="Days to expiration", showgrid=False, color=colors.INK_MUTED),
+        yaxis=dict(title="Implied volatility", showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED, tickformat=".0%"),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if rv_20 is not None:
+        front_iv = ts.iloc[0]["atm_iv"]
+        spread = front_iv - rv_20
+        c1, c2 = st.columns(2)
+        c1.metric("Front-month ATM IV − 20d realized", f"{spread:+.1%}", help="Positive = options pricing more movement than has recently occurred (rich). Negative = cheap.")
+        slope = ts.iloc[-1]["atm_iv"] - ts.iloc[0]["atm_iv"]
+        c2.metric("Term structure slope (back − front)", f"{slope:+.1%}", help="Positive = contango (normal). Negative = backwardation (event risk priced near-term).")
 
 
 def _strike_ev_table(strike_evs) -> pd.DataFrame:
@@ -739,6 +840,188 @@ def _render_strategy_profile(
             "very large but finite number."
         )
 
+    if live_capable and dte is not None and dte > 0:
+        if st.button("Send to Options Lab →", key=f"send_to_lab_{key_suffix}"):
+            st.session_state["lab_import"] = {
+                "legs": [
+                    {"option_type": leg.option_type, "strike": leg.strike, "premium": leg.premium, "contracts": leg.contracts, "iv": leg.iv}
+                    for leg in legs
+                ],
+                "underlying_symbol": underlying_symbol,
+                "dte": dte,
+                "spot": spot,
+            }
+            st.success("Sent — open the **Options Lab** tab to explore this structure's P&L surface, Greeks, and scenarios.")
+    elif not live_capable:
+        st.caption("Options Lab needs every leg's current IV — not available for this setup (manual entries with IV = 0 are treated as unset).")
+
+
+_SPREAD_STRATEGY_LABELS = {
+    "Bear put spread (bearish, defined risk)": "bear_put_spread",
+    "Bull put spread (bullish/neutral, credit)": "bull_put_spread",
+    "Straddle (long vol, big move either direction)": "straddle",
+    "Strangle (long vol, cheaper than a straddle)": "strangle",
+}
+
+
+def render_spread_selector(d: dict):
+    st.subheader("Spread & straddle strike selector")
+    st.caption(
+        "Searches strikes actually listed in the live chain and ranks candidates by comparing the market's "
+        "price for the structure against YOUR OWN volatility view — same edge concept as the Risk Tool tab, "
+        "extended to two legs. Read the methodology note below before trusting any ranking."
+    )
+    with st.expander("Methodology / what this does and doesn't do", expanded=False):
+        st.markdown(
+            "- Every candidate comes from strikes **actually listed** in the live option chain for the "
+            "expiration you pick — not synthetic price levels — so it's something you could really place.\n"
+            "- Max profit, max loss, and breakeven(s) are **exact**, from the payoff's piecewise-linear shape "
+            "(same engine as the Strategy Payoff tab), not simulated.\n"
+            "- **Edge EV** reprices every leg at your own realized/forecast vol instead of market IV, sums with "
+            "the correct signs, and compares that 'fair value' to what you'd actually pay/receive at market "
+            "prices. This is the only place real, quantifiable edge can come from here — it is **not** a "
+            "directional prediction. With no vol view selected, candidates are ranked by risk:reward instead.\n"
+            "- **Probability of profit** is a blended-IV approximation: it averages the two legs' implied vols "
+            "into one assumed lognormal distribution, then measures the odds of finishing past the "
+            "breakeven(s). Least reliable when the legs' IVs are far apart (e.g. a wide strangle across a "
+            "steep skew).\n"
+            "- For straddles/strangles specifically: **edge EV naturally shrinks toward deep ITM/OTM strikes**, "
+            "since a leg with little extrinsic value left has little vega exposure to your vol view being "
+            "right or wrong. The top-ranked candidate can end up being the one with the *least* vega at stake "
+            "rather than the strongest actual view — sanity-check the strikes against where you'd realistically "
+            "expect the move, not just the ranking.\n"
+            "- Search is bounded to strikes within your chosen window of ATM, not the entire chain."
+        )
+
+    with st.form("spread_selector_inputs"):
+        c1, c2, c3 = st.columns(3)
+        ticker = c1.text_input("Ticker", value=st.session_state.get("skew_symbol_input", "")).strip().upper()
+        strategy_label = c2.selectbox("Strategy", list(_SPREAD_STRATEGY_LABELS.keys()), key="spread_selector_strategy")
+        strike_increment = c3.number_input("Strike increment ($)", min_value=0.5, value=5.0, step=0.5, key="spread_selector_increment")
+
+        c4, c5 = st.columns(2)
+        num_each_side = c4.slider("Strikes to search, each side of ATM", min_value=2, max_value=15, value=6, key="spread_selector_width")
+        vol_method = c5.selectbox(
+            "Vol estimate for edge check (1yr history)",
+            ["None (rank by risk:reward instead)", "Close-to-close (realized)", "GARCH(1,1) forecast", "EGARCH(1,1) forecast (asymmetric)"],
+            key="spread_selector_vol_method",
+        )
+        submitted = st.form_submit_button("Find best strikes", type="primary")
+
+    if not submitted:
+        st.info("Pick a ticker and strategy above, then click Find best strikes.")
+        return
+    if not ticker:
+        st.error("Enter a ticker.")
+        return
+
+    strategy = _SPREAD_STRATEGY_LABELS[strategy_label]
+
+    try:
+        expirations = fetch_expirations(ticker)
+    except Exception as exc:
+        st.error(f"Couldn't load expirations for {ticker}: {exc}")
+        return
+    if not expirations:
+        st.warning(f"No option chain found for {ticker}. Check the ticker and that it has listed options.")
+        return
+    expiration = st.selectbox("Expiration", expirations, key="spread_selector_expiration")
+
+    try:
+        chain = fetch_chain(ticker, expiration)
+    except Exception as exc:
+        st.error(f"Couldn't load the option chain: {exc}")
+        return
+    if chain.empty:
+        st.warning("No quoted contracts returned for this expiration.")
+        return
+
+    try:
+        spot = data_fetch.get_stock_quote(ticker)["mark"]
+    except Exception as exc:
+        st.error(f"Couldn't get a live price for {ticker}: {exc}")
+        return
+    if not spot:
+        st.error(f"Couldn't get a live price for {ticker}.")
+        return
+
+    dte = max((pd.Timestamp(expiration).date() - date.today()).days, 1)
+    T = dte / 365.0
+    config = DEFAULT_CONFIG
+
+    my_vol = None
+    if vol_method != "None (rank by risk:reward instead)":
+        try:
+            hist = fetch_price_history(ticker)
+            log_returns = np.log(hist["close"] / hist["close"].shift(1)).dropna()
+            if vol_method == "Close-to-close (realized)":
+                my_vol = rv.close_to_close_vol(hist["close"])
+            elif vol_method == "GARCH(1,1) forecast":
+                garch_fit = rv.fit_garch_11(log_returns)
+                my_vol = rv.garch_forecast_vol(garch_fit, horizon_days=dte)
+            else:
+                egarch_fit = rv.fit_egarch_11(log_returns)
+                my_vol = rv.egarch_forecast_vol(egarch_fit, horizon_days=dte)
+        except Exception as exc:
+            st.warning(f"Couldn't compute {vol_method} ({exc}) — ranking by risk:reward instead.")
+
+    candidates = spread_selection.find_best_spreads(
+        strategy, chain, spot, T, config.risk_free_rate, config.dividend_yield,
+        strike_increment, num_each_side=int(num_each_side), config=config, my_vol=my_vol,
+    )
+    if not candidates:
+        st.warning("No valid candidates found in this strike window — try a wider search or a different expiration.")
+        return
+
+    st.markdown(f"##### Top candidates — {dte} DTE, {'ranked by edge EV' if my_vol else 'ranked by risk:reward'}")
+    rows = [
+        {
+            "strikes": c.strike_label(),
+            "net debit/credit": c.net_cost,
+            "max profit": c.max_profit if c.max_profit is not None else float("inf"),
+            "max loss": c.max_loss if c.max_loss is not None else float("-inf"),
+            "risk:reward": c.risk_reward,
+            "P(profit)": c.prob_profit,
+            "edge EV": c.edge_ev,
+            "breakeven(s)": ", ".join(f"${b:.2f}" for b in c.breakevens),
+            "setup": "Poor (< min R:R)" if c.is_poor_setup else "OK",
+        }
+        for c in candidates
+    ]
+    table = pd.DataFrame(rows)
+    column_config = {
+        "net debit/credit": st.column_config.NumberColumn(format="$%+.2f", help="Per share. Positive = debit paid, negative = credit received."),
+        "max profit": st.column_config.NumberColumn(format="$%.2f", help="Per share."),
+        "max loss": st.column_config.NumberColumn(format="$%.2f", help="Per share."),
+        "risk:reward": st.column_config.NumberColumn(format="%.2f:1"),
+        "P(profit)": st.column_config.NumberColumn(format="percent"),
+        "edge EV": st.column_config.NumberColumn(format="$%+.2f", help="Per share. Your-vol fair value minus market cost."),
+    }
+    if my_vol is None:
+        table = table.drop(columns=["edge EV"])
+        column_config.pop("edge EV")
+    st.dataframe(table, use_container_width=True, hide_index=True, column_config=column_config)
+    st.caption("$ figures are per share — multiply by 100 for per-contract dollars.")
+
+    if my_vol:
+        c1, c2 = st.columns(2)
+        c1.metric(vol_method, f"{my_vol:.1%}")
+        c2.metric("Best candidate's edge EV", f"${candidates[0].edge_ev:+.2f}/share")
+
+    st.markdown("##### Best candidate — payoff diagram")
+    best = candidates[0]
+    legs_for_payoff = [
+        option_strategy.OptionLeg(
+            option_type=cl.option_type, strike=cl.strike, premium=cl.mid,
+            contracts=1.0 if side == "long" else -1.0, iv=cl.iv,
+        )
+        for side, cl in best.legs
+    ]
+    live_capable = all(leg.iv is not None for leg in legs_for_payoff)
+    _render_strategy_profile(
+        legs_for_payoff, ticker, key_suffix=f"spread_selector_{ticker}_{expiration}", dte=dte, live_capable=live_capable,
+    )
+
 
 def render_strategy_payoff(d: dict):
     st.subheader("Multi-leg option strategy payoff")
@@ -818,6 +1101,394 @@ def render_strategy_payoff(d: dict):
     _render_strategy_profile(legs, underlying_symbol, key_suffix="manual", dte=int(dte_input), live_capable=live_capable)
 
 
+def render_options_lab(d: dict):
+    st.subheader("Options Lab")
+    st.caption(
+        "P&L across spot price and time, Greeks sensitivity, and shock scenarios for any option structure — "
+        "build one from scratch, import an open position, or click **Send to Options Lab** on a Spread Selector "
+        "or Strategy Payoff result."
+    )
+    with st.expander("Methodology / what this does and doesn't do", expanded=False):
+        st.markdown(
+            "- Every chart reprices via Black-Scholes at each leg's **own IV**, held fixed except where you "
+            "explicitly shock it. There is no vol surface here — no skew that moves as spot moves, no smile — "
+            "so treat this as *'what if price/vol move along this specific path,'* not a full forward-looking "
+            "model of how IV itself would realistically shift.\n"
+            "- The P&L grid's expiration row is **exact** intrinsic value (same engine as Strategy Payoff); "
+            "every other cell is a Black-Scholes mark-to-market estimate for that point in time.\n"
+            "- Greeks are aggregated across all legs, signed and multiplier-adjusted — a short leg's Greeks "
+            "subtract, not add. Greeks are undefined (shown as zero) at/past expiration.\n"
+            "- The earnings simulator applies the **same** relative IV crush to every leg — real post-earnings "
+            "crush can differ leg-to-leg (front-week options typically crush harder than back-month)."
+        )
+
+    st.markdown("##### Strategy")
+    source = st.radio(
+        "Source", ["Build manually", "Import an open position", "Use last Send-to-Lab import"],
+        key="lab_source", horizontal=True,
+    )
+
+    active = None
+    if source == "Build manually":
+        with st.form("lab_manual_inputs"):
+            c1, c2, c3 = st.columns(3)
+            m_symbol = c1.text_input("Underlying (for spot price + centering)", value=st.session_state.get("skew_symbol_input", "")).strip().upper()
+            m_dte = int(c2.number_input("Days to expiration", min_value=1, value=30, step=1, key="lab_manual_dte"))
+            n_legs = int(c3.number_input("Number of legs", min_value=1, max_value=4, value=2, step=1, key="lab_manual_nlegs"))
+            leg_inputs = []
+            for i in range(n_legs):
+                st.markdown(f"###### Leg {i + 1}")
+                lc1, lc2, lc3, lc4, lc5, lc6 = st.columns(6)
+                side = lc1.selectbox("Side", ["Long", "Short"], key=f"lab_leg_side_{i}")
+                opt_type = lc2.selectbox("Type", ["Call", "Put"], key=f"lab_leg_type_{i}")
+                strike = lc3.number_input("Strike ($)", min_value=0.0, value=0.0, step=0.5, key=f"lab_leg_strike_{i}")
+                premium = lc4.number_input("Premium ($/share)", min_value=0.0, value=0.0, step=0.01, key=f"lab_leg_premium_{i}")
+                contracts = lc5.number_input("Contracts", min_value=1.0, value=1.0, step=1.0, key=f"lab_leg_contracts_{i}")
+                iv_pct = lc6.number_input("IV (%)", min_value=0.1, value=30.0, step=1.0, key=f"lab_leg_iv_{i}")
+                leg_inputs.append((side, opt_type, strike, premium, contracts, iv_pct))
+            submitted = st.form_submit_button("Build", type="primary")
+        if submitted:
+            built_legs = [
+                {"option_type": t.lower(), "strike": k, "premium": p, "contracts": (c if s == "Long" else -c), "iv": iv / 100.0}
+                for s, t, k, p, c, iv in leg_inputs
+                if k > 0
+            ]
+            if not built_legs:
+                st.error("Enter at least one leg with a strike > 0.")
+            else:
+                st.session_state["lab_manual_strategy"] = {"legs": built_legs, "underlying_symbol": m_symbol, "dte": m_dte, "spot": None}
+        active = st.session_state.get("lab_manual_strategy")
+        if not active:
+            st.info("Fill in the legs above and click Build.")
+            return
+
+    elif source == "Import an open position":
+        opt = d["option_positions"]
+        combos = []
+        if not opt.empty:
+            for (symbol, expiration), group in opt.groupby(["symbol", "expiration"]):
+                combos.append((symbol, expiration, group))
+        if not combos:
+            st.caption("No open option positions to import.")
+            return
+        labels = [f"{symbol} exp {expiration} ({len(group)} leg(s))" for symbol, expiration, group in combos]
+        idx = st.selectbox("Position", range(len(labels)), format_func=lambda i: labels[i], key="lab_position_select")
+        symbol, expiration, group = combos[idx]
+        built_legs = [
+            {
+                "option_type": row["type"], "strike": float(row["strike"]), "premium": abs(float(row["avg_price"])),
+                "contracts": float(row["quantity"]) if row["side"] == "long" else -float(row["quantity"]),
+                "iv": float(row["implied_volatility"]) if pd.notna(row["implied_volatility"]) and row["implied_volatility"] > 0 else None,
+            }
+            for _, row in group.iterrows()
+        ]
+        dte_val = int(group["dte"].iloc[0]) if pd.notna(group["dte"].iloc[0]) else 30
+        if not all(leg["iv"] is not None for leg in built_legs):
+            st.warning("One or more legs on this position are missing a live IV — Options Lab needs it on every leg.")
+            return
+        active = {"legs": built_legs, "underlying_symbol": symbol, "dte": dte_val, "spot": None}
+
+    else:  # Use last Send-to-Lab import
+        active = st.session_state.get("lab_import")
+        if not active:
+            st.info("Nothing sent yet — click **Send to Options Lab** on a result in Strategy Payoff or Spread Selector, or switch source above.")
+            return
+        st.caption(f"Loaded: {active['underlying_symbol']}, {len(active['legs'])} leg(s), {active['dte']} DTE.")
+
+    legs = [option_strategy.OptionLeg(**leg) for leg in active["legs"]]
+    underlying_symbol = active["underlying_symbol"]
+    dte = active["dte"]
+
+    spot = active.get("spot")
+    if not spot and underlying_symbol:
+        try:
+            spot = data_fetch.get_stock_quote(underlying_symbol)["mark"]
+        except Exception:
+            spot = None
+    if not spot:
+        strikes = [leg.strike for leg in legs]
+        spot = sum(strikes) / len(strikes)
+        st.caption(f"No live quote for {underlying_symbol or 'this underlying'} — centering on the average strike (${spot:,.2f}) instead.")
+
+    config = DEFAULT_CONFIG
+    T_years = dte / 365.0
+
+    st.divider()
+    profile = option_strategy.analyze_strategy(legs)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Max profit", money(profile.max_profit) if profile.max_profit is not None else "Unlimited")
+    c2.metric("Max loss", money(profile.max_loss) if profile.max_loss is not None else "Unlimited")
+    debit_label = "paid" if profile.net_debit >= 0 else "received"
+    c3.metric("Net debit / credit", f"{money(abs(profile.net_debit))} ({debit_label})")
+    c4.metric("Breakeven(s)", ", ".join(f"${b:,.2f}" for b in profile.breakevens) if profile.breakevens else "—")
+
+    st.markdown("##### Live what-if")
+    st.caption("Drag to reprice instantly — the scenario point is marked on the P&L surface and Greeks curves below.")
+    wc1, wc2, wc3 = st.columns(3)
+    spot_move_pct = wc1.slider("Spot move (%)", -30.0, 30.0, 0.0, step=1.0, key="lab_whatif_spot") / 100.0
+    days_forward = wc2.slider("Days forward", 0, dte, 0, step=1, key="lab_whatif_days")
+    iv_shock_pct = wc3.slider("IV shock (%, relative)", -60.0, 60.0, 0.0, step=5.0, key="lab_whatif_iv") / 100.0
+
+    scenario = options_lab.evaluate_scenario(
+        legs, spot, dte, spot_move_pct=spot_move_pct, iv_mult=(1 + iv_shock_pct),
+        days_forward=days_forward, r=config.risk_free_rate, q=config.dividend_yield,
+    )
+    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+    sc1.metric("Scenario spot", f"${scenario.spot:,.2f}")
+    sc2.metric("Scenario P&L", money(scenario.pl))
+    if scenario.greeks:
+        sc3.metric("Delta", f"{scenario.greeks['delta']:+.2f}")
+        sc4.metric("Theta/day", f"{scenario.greeks['theta']:+.2f}")
+        sc5.metric("Vega", f"{scenario.greeks['vega']:+.2f}")
+    else:
+        sc3.metric("Delta", "—")
+        sc4.metric("Theta/day", "—")
+        sc5.metric("Vega", "—")
+        st.caption("At/past expiration — Greeks aren't defined here.")
+
+    st.markdown("##### P&L surface (spot × days forward)")
+    st.caption("Row 0 = right now; the last row = expiration (exact intrinsic value). The white marker is your what-if scenario above.")
+    spot_range_pct = st.slider("Spot range (± % around current)", min_value=0.05, max_value=0.50, value=0.20, step=0.05, key="lab_heatmap_range")
+    grid = options_lab.pl_grid(legs, spot, dte, config.risk_free_rate, config.dividend_yield, spot_range_pct=spot_range_pct)
+    pivot = grid.pivot(index="days_forward", columns="spot", values="pl")
+    zmax = float(pivot.to_numpy().__abs__().max()) or 1.0
+
+    fig_hm = go.Figure(
+        data=go.Heatmap(
+            z=pivot.values, x=pivot.columns, y=pivot.index,
+            colorscale=[[0, colors.DIVERGING_NEG], [0.5, colors.DIVERGING_MID], [1, colors.DIVERGING_POS]],
+            zmid=0, zmin=-zmax, zmax=zmax,
+            colorbar=dict(title="P&L ($)"),
+            hovertemplate="Spot $%{x:,.2f}<br>Days forward %{y}<br>P&L $%{z:,.0f}<extra></extra>",
+        )
+    )
+    fig_hm.add_trace(
+        go.Scatter(
+            x=[scenario.spot], y=[scenario.days_forward], mode="markers",
+            marker=dict(symbol="x", size=14, color="white", line=dict(color=colors.INK_PRIMARY, width=2)),
+            name="Scenario", hovertemplate="Scenario<br>Spot $%{x:,.2f}<br>Days forward %{y}<extra></extra>",
+        )
+    )
+    if spot:
+        fig_hm.add_vline(x=spot, line=dict(color=colors.INK_MUTED, dash="dash", width=1), annotation_text="Spot now", annotation_position="top")
+    fig_hm.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=20, b=10),
+        plot_bgcolor=colors.SURFACE, paper_bgcolor=colors.SURFACE,
+        xaxis=dict(title="Underlying price ($)", color=colors.INK_MUTED),
+        yaxis=dict(title="Days forward from today", color=colors.INK_MUTED),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_hm, use_container_width=True)
+
+    st.markdown("##### Greeks sensitivity (vs. spot, at current IV & time)")
+    curve = options_lab.greeks_curve(legs, spot, T_years, config.risk_free_rate, config.dividend_yield, spot_range_pct=spot_range_pct)
+    greek_colors = {"delta": colors.CATEGORICAL[0], "gamma": colors.CATEGORICAL[1], "theta": colors.CATEGORICAL[5], "vega": colors.CATEGORICAL[4]}
+    grid_cols = st.columns(2)
+    for i, greek in enumerate(("delta", "gamma", "theta", "vega")):
+        fig_g = go.Figure()
+        fig_g.add_trace(go.Scatter(x=curve["spot"], y=curve[greek], mode="lines", line=dict(color=greek_colors[greek], width=2)))
+        if spot:
+            fig_g.add_vline(x=spot, line=dict(color=colors.INK_MUTED, dash="dash", width=1))
+        fig_g.add_vline(x=scenario.spot, line=dict(color=colors.STATUS_WARNING, dash="dot", width=1.5))
+        fig_g.update_layout(
+            height=220,
+            margin=dict(l=10, r=10, t=30, b=10),
+            plot_bgcolor=colors.SURFACE, paper_bgcolor=colors.SURFACE,
+            title=dict(text=greek.capitalize(), font=dict(size=13)),
+            xaxis=dict(showgrid=False, color=colors.INK_MUTED),
+            yaxis=dict(showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+        )
+        grid_cols[i % 2].plotly_chart(fig_g, use_container_width=True, key=f"lab_greek_{greek}")
+    st.caption("Gray dashed line = current spot. Orange dotted line = your what-if scenario spot.")
+
+    st.divider()
+    st.markdown("##### Earnings / IV-crush simulator")
+    st.caption(
+        "Models a discrete event: a spot gap plus a vol crush (implied vol typically drops sharply right after "
+        "an earnings print), evaluated the day after. Same repricing engine as the sliders above, framed as a "
+        "one-shot event instead of a live drag."
+    )
+    ec1, ec2, ec3 = st.columns(3)
+    earnings_spot_move = ec1.number_input("Expected spot move on the print (%)", min_value=-50.0, max_value=50.0, value=5.0, step=0.5, key="lab_earnings_spot") / 100.0
+    iv_crush_pct = ec2.number_input("IV crush (%, relative drop)", min_value=0.0, max_value=95.0, value=40.0, step=5.0, key="lab_earnings_ivcrush")
+    earnings_days_forward = int(ec3.number_input("Days forward (day after the print)", min_value=0, max_value=dte, value=min(1, dte), step=1, key="lab_earnings_days"))
+
+    if st.button("Run earnings scenario", key="lab_run_earnings"):
+        before = options_lab.evaluate_scenario(legs, spot, dte, days_forward=0, r=config.risk_free_rate, q=config.dividend_yield)
+        after = options_lab.evaluate_scenario(
+            legs, spot, dte, spot_move_pct=earnings_spot_move, iv_mult=(1 - iv_crush_pct / 100.0),
+            days_forward=earnings_days_forward, r=config.risk_free_rate, q=config.dividend_yield,
+        )
+        ac1, ac2, ac3 = st.columns(3)
+        ac1.metric("Spot: before → after", f"${before.spot:,.2f} → ${after.spot:,.2f}")
+        ac2.metric("P&L: before → after", f"{money(before.pl)} → {money(after.pl)}", money(after.pl - before.pl))
+        vega_before = before.greeks.get("vega") if before.greeks else None
+        ac3.metric(
+            "Vega before the event", f"{vega_before:+.2f}" if vega_before is not None else "—",
+            help="Positive vega positions lose the most from an IV crush; negative vega positions benefit.",
+        )
+        st.caption(
+            f"Modeled crush: every leg's IV × {(1 - iv_crush_pct / 100.0):.2f} ({iv_crush_pct:.0f}% relative drop), "
+            "applied uniformly across legs — see the methodology note above for why that's a simplification."
+        )
+
+
+_HEDGE_PRESETS = {
+    "XLM (crypto)": ("XLM", "crypto"),
+    "USO — oil ETF (Robinhood has no 'USOIL' ticker)": ("USO", "stock"),
+    "SPY": ("SPY", "stock"),
+    "Custom": (None, None),
+}
+
+
+def render_delta_hedge(d: dict):
+    st.subheader("Delta hedge builder")
+    st.caption(
+        "Sizes a hedge in a *different* instrument (an ETF, a commodity proxy, a crypto) against a position's "
+        "delta-equivalent exposure, scaled by that instrument's historical beta to the position's underlying — "
+        "not a same-underlying options hedge. Useful when you want to offset directional risk with something "
+        "liquid you can actually trade (e.g. hedge an oil-sensitive equity position with USO, or a small-cap "
+        "growth book with XLM as a risk-appetite proxy)."
+    )
+    with st.expander("What this does and doesn't do", expanded=False):
+        st.markdown(
+            "- Offsets the **correlated portion** of directional (delta) risk only — not theta or vega on an "
+            "options position.\n"
+            "- Does **not** guarantee a profitable trade. The position can still lose money on its "
+            "idiosyncratic move; **R²** below tells you how much of the move the hedge instrument actually "
+            "explains — a low R² means this hedge is doing much less than the notional suggests.\n"
+            "- **Decays over time.** Option delta moves with spot/time (gamma/theta), and beta is a rolling "
+            "estimate that drifts — recompute and rebalance periodically, this isn't set-and-forget."
+        )
+
+    col_pos, col_hedge = st.columns(2)
+
+    with col_pos:
+        st.markdown("##### Position to hedge")
+        position_ticker = st.text_input("Underlying ticker", key="hedge_pos_ticker", placeholder="e.g. AXP").strip().upper()
+        position_mode = st.radio("Position type", ["Shares / ETF", "Option"], key="hedge_pos_mode", horizontal=True)
+        if position_mode == "Shares / ETF":
+            qty = st.number_input("Quantity (unsigned)", min_value=0.0, value=100.0, step=1.0, key="hedge_pos_qty")
+            side = st.selectbox("Side", ["long", "short"], key="hedge_pos_side")
+        else:
+            delta = st.number_input(
+                "Delta (signed — e.g. -0.45 for a long put, +0.30 for a short put)",
+                value=0.45, step=0.01, format="%.2f", key="hedge_pos_delta",
+            )
+            contracts = st.number_input("Contracts (unsigned)", min_value=0.0, value=1.0, step=1.0, key="hedge_pos_contracts")
+            contract_side = st.selectbox("Position side", ["long", "short"], key="hedge_pos_contract_side")
+
+    with col_hedge:
+        st.markdown("##### Hedge instrument")
+        preset_label = st.selectbox("Quick pick", list(_HEDGE_PRESETS.keys()), key="hedge_preset")
+        preset_ticker, preset_type = _HEDGE_PRESETS[preset_label]
+        if preset_ticker:
+            hedge_ticker = preset_ticker
+            hedge_type = preset_type
+            st.text_input("Hedge ticker", value=hedge_ticker, disabled=True, key="hedge_ticker_display")
+        else:
+            hedge_ticker = st.text_input("Hedge ticker", key="hedge_ticker_custom", placeholder="e.g. UNG, DBA, BTC").strip().upper()
+            hedge_type = st.radio("Instrument type", ["stock", "crypto"], key="hedge_type_custom", horizontal=True)
+        lookback_days = st.slider("Beta lookback window (trading days)", min_value=20, max_value=252, value=90, key="hedge_lookback")
+        multiplier = st.number_input(
+            "Hedge contract multiplier", min_value=0.0001, value=1.0, step=1.0, key="hedge_multiplier",
+            help="1.0 for a plain ETF/stock/crypto hedge. Set to the units-per-contract if you're actually "
+            "sizing a futures hedge (e.g. 1000 for CME WTI/CL, 100 for Micro WTI/MCL) with the hedge price "
+            "quoted per unit.",
+        )
+
+    if not position_ticker or not hedge_ticker:
+        st.caption("Enter both a position ticker and a hedge ticker to compute a hedge size.")
+        return
+
+    if not st.button("Calculate hedge", type="primary", key="hedge_calculate"):
+        return
+
+    try:
+        underlying_hist = fetch_price_history(position_ticker)
+    except Exception as exc:
+        st.error(f"Couldn't load price history for {position_ticker}: {exc}")
+        return
+    try:
+        hedge_hist = (
+            data_fetch.get_crypto_historicals(hedge_ticker) if hedge_type == "crypto" else fetch_price_history(hedge_ticker)
+        )
+    except Exception as exc:
+        st.error(f"Couldn't load price history for {hedge_ticker}: {exc}")
+        return
+
+    if underlying_hist.empty or len(underlying_hist) < 4:
+        st.error(f"Not enough price history for {position_ticker} — check the ticker.")
+        return
+    if hedge_hist.empty or len(hedge_hist) < 4:
+        st.error(f"Not enough price history for {hedge_ticker} — check the ticker (Robinhood may list it under a different symbol, e.g. USO instead of USOIL).")
+        return
+
+    underlying_close = underlying_hist.set_index("date")["close"].tail(lookback_days + 1)
+    hedge_close = hedge_hist.set_index("date")["close"].tail(lookback_days + 1)
+    underlying_returns = hedge.simple_returns(underlying_close)
+    hedge_returns = hedge.simple_returns(hedge_close)
+
+    try:
+        beta_est = hedge.estimate_beta(underlying_returns, hedge_returns)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    try:
+        underlying_price = data_fetch.get_stock_quote(position_ticker)["mark"] or float(underlying_close.iloc[-1])
+    except Exception:
+        underlying_price = float(underlying_close.iloc[-1])
+    try:
+        hedge_price = (
+            data_fetch.get_crypto_quote(hedge_ticker)["mark"] if hedge_type == "crypto" else data_fetch.get_stock_quote(hedge_ticker)["mark"]
+        ) or float(hedge_close.iloc[-1])
+    except Exception:
+        hedge_price = float(hedge_close.iloc[-1])
+
+    if position_mode == "Shares / ETF":
+        exposure_shares = hedge.share_position_exposure_shares(qty, side)
+    else:
+        signed_contracts = contracts if contract_side == "long" else -contracts
+        exposure_shares = hedge.option_position_exposure_shares(delta, signed_contracts)
+
+    result = hedge.size_hedge(exposure_shares, underlying_price, beta_est.beta, hedge_price, multiplier)
+
+    st.markdown("##### Result")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Beta (to hedge instrument)", f"{beta_est.beta:.2f}", help=f"OLS slope over {beta_est.n_obs} overlapping daily returns.")
+    c2.metric("R²", f"{beta_est.r_squared:.1%}", help="Fraction of the position's return variance this hedge instrument explains. Low R² = a lot of unhedged idiosyncratic risk remains.")
+    c3.metric("Delta-equivalent exposure", money(result.exposure_dollars))
+    c4.metric("Hedge notional", money(result.hedge_dollars))
+
+    action = "Buy / go long" if result.direction == "long" else "Sell / go short"
+    unit_word = "contracts" if multiplier != 1.0 else "shares" if hedge_type == "stock" else "units"
+    st.success(f"**{action} {abs(result.hedge_units):,.2f} {unit_word} of {hedge_ticker}** to hedge this position's correlated exposure.")
+
+    if beta_est.r_squared < 0.15:
+        st.warning(f"R² is only {beta_est.r_squared:.1%} — {hedge_ticker} explains very little of {position_ticker}'s recent moves. This hedge will leave most of the position's risk unhedged.")
+
+    st.markdown("##### Indexed price comparison")
+    idx = pd.DataFrame({
+        position_ticker: vol_analysis.cumulative_return(underlying_close),
+        hedge_ticker: vol_analysis.cumulative_return(hedge_close),
+    }).dropna()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=idx.index, y=idx[position_ticker], mode="lines", name=position_ticker, line=dict(color=colors.CATEGORICAL[0], width=2)))
+    fig.add_trace(go.Scatter(x=idx.index, y=idx[hedge_ticker], mode="lines", name=hedge_ticker, line=dict(color=colors.CATEGORICAL[5], width=2)))
+    fig.update_layout(
+        height=300,
+        margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor=colors.SURFACE,
+        paper_bgcolor=colors.SURFACE,
+        xaxis=dict(showgrid=False, color=colors.INK_MUTED),
+        yaxis=dict(title="Indexed return", showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED, ticksuffix="%"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def render_orders(d: dict):
     st.subheader("Open orders")
     open_orders = d["open_orders"]
@@ -826,7 +1497,7 @@ def render_orders(d: dict):
     else:
         st.dataframe(open_orders, use_container_width=True, hide_index=True)
 
-    st.subheader("Recent fills (last 90 days)")
+    st.subheader("Recent fills (all-time)")
     hist = d["order_history"]
     if hist.empty:
         st.caption("No recent fills.")
@@ -868,16 +1539,16 @@ def render_journal(d: dict):
 def render_win_rate(d: dict):
     st.subheader("Win rate")
     st.caption(
-        "Realized round-trip trades, FIFO-matched from your filled order history (same 90-day window as "
-        "Orders & History). Equity matching is exact; options are matched per underlying symbol only, since "
-        "fill history doesn't carry per-contract strike/expiration identity — if you hold multiple different "
-        "contracts on the same underlying at once, fills across them can get cross-matched. Only **closed** "
-        "trades count here; open positions with no matching exit aren't included."
+        "Realized round-trip trades, FIFO-matched **per exact contract** from your full filled order history "
+        "(same all-time data as Orders & History) — each option fill is matched against its own specific "
+        "strike/expiration/type, so holding multiple different contracts on the same underlying at once no "
+        "longer risks cross-matching. Only **closed** trades count here; open positions with no matching exit "
+        "aren't included."
     )
 
     trips_df = performance.round_trips_to_frame(performance.match_round_trips(d["order_history"]))
     if trips_df.empty:
-        st.caption("No closed round-trip trades in the last 90 days yet.")
+        st.caption("No closed round-trip trades yet.")
         return
 
     stats = performance.win_rate_stats(trips_df)
@@ -966,8 +1637,8 @@ def main():
 
     tabs = st.tabs(
         [
-            "Overview", "Positions & Greeks", "Vol Exposure", "Vol Skew", "Risk Tool",
-            "Strategy Payoff", "Orders & History", "Win Rate", "Journal / Export",
+            "Overview", "Positions & Greeks", "Vol Exposure", "Vol Skew", "Risk Tool", "Spread Selector",
+            "Strategy Payoff", "Options Lab", "Delta Hedge", "Orders & History", "Win Rate", "Journal / Export",
         ]
     )
     with tabs[0]:
@@ -983,12 +1654,18 @@ def main():
         st.divider()
         render_position_monitor(d)
     with tabs[5]:
-        render_strategy_payoff(d)
+        render_spread_selector(d)
     with tabs[6]:
-        render_orders(d)
+        render_strategy_payoff(d)
     with tabs[7]:
-        render_win_rate(d)
+        render_options_lab(d)
     with tabs[8]:
+        render_delta_hedge(d)
+    with tabs[9]:
+        render_orders(d)
+    with tabs[10]:
+        render_win_rate(d)
+    with tabs[11]:
         render_journal(d)
 
 
