@@ -1,9 +1,9 @@
 # Matches app/colors.py so the chrome (buttons, tabs, metrics) doesn't clash
 # with the Plotly charts, which pull their palette from that same file.
 [theme]
-base = "light"
-primaryColor = "#2a78d6"
-backgroundColor = "#fcfcfb"
-secondaryBackgroundColor = "#f0efec"
-textColor = "#0b0b0b"
+base = "dark"
+primaryColor = "#4c9aff"
+backgroundColor = "#0d1117"
+secondaryBackgroundColor = "#161b22"
+textColor = "#e8eaed"
 font = "sans serif"

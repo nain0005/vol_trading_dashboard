@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from app import colors, journal, performance, vol_analysis
+from app import colors, journal, oi_history, performance, vol_analysis
 from app.auth import ensure_logged_in, is_demo_mode, logout
 from risk_tool import hedge
 from risk_tool import option_strategy
@@ -13,6 +13,7 @@ from risk_tool import options_lab
 from risk_tool import portfolio_risk
 from risk_tool import realized_vol as rv
 from risk_tool import risk_manager
+from risk_tool import sigma_moves
 from risk_tool import sizing as risk_sizing
 from risk_tool import spread_selection
 from risk_tool import strike_selection
@@ -56,9 +57,10 @@ def inject_custom_css():
             justify-content: space-between;
             padding: 0.9rem 1.4rem;
             margin: -1rem -1rem 1.2rem -1rem;
-            background: linear-gradient(135deg, {colors.INK_PRIMARY} 0%, #1c2f45 60%, {colors.CATEGORICAL[0]} 160%);
+            background: linear-gradient(135deg, {colors.CHROME_DEEP} 0%, #0f1b2e 55%, #16324f 100%);
+            border-bottom: 1px solid rgba(76,154,255,0.35);
             border-radius: 0 0 14px 14px;
-            box-shadow: 0 4px 18px rgba(0,0,0,0.12);
+            box-shadow: 0 4px 24px rgba(0,0,0,0.45);
         }}
         .vt-header-left {{ display: flex; align-items: center; gap: 0.75rem; }}
         .vt-header-icon {{ font-size: 1.9rem; line-height: 1; }}
@@ -81,10 +83,13 @@ def inject_custom_css():
             border: 1px solid {colors.GRIDLINE};
             border-radius: 10px;
             padding: 0.85rem 1rem 0.7rem 1rem;
-            box-shadow: 0 1px 2px rgba(11,11,11,0.04);
-            transition: border-color 0.15s ease;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
         }}
-        [data-testid="stMetric"]:hover {{ border-color: {colors.CATEGORICAL[0]}; }}
+        [data-testid="stMetric"]:hover {{
+            border-color: {colors.CATEGORICAL[0]};
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 0 1px {colors.CATEGORICAL[0]}, 0 6px 16px rgba(76,154,255,0.15);
+        }}
         [data-testid="stMetricLabel"] {{
             font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
             color: {colors.INK_MUTED};
@@ -524,6 +529,139 @@ def render_portfolio_risk(d: dict):
         st.caption(f"{total_skipped} position(s) skipped in the stress test (missing live price, IV, or DTE).")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_price_history_span(symbol: str, span: str):
+    return data_fetch.get_equity_historicals(symbol, span=span)
+
+
+def render_sigma_screener(d: dict):
+    st.subheader("Sigma move screener")
+    st.caption(
+        "For each ticker: how often has it actually moved 2σ+ or 3σ+ (relative to its own trailing rolling "
+        "realized vol), and is it currently \"overdue\" by that history?"
+    )
+    with st.expander("Methodology — read this before trusting the ranking", expanded=False):
+        st.markdown(
+            "- **Sigma is a trailing rolling estimate** (20 trading days by default), shifted by one day so a "
+            "day's own return never inflates the sigma used to judge it — no look-ahead.\n"
+            "- **Two recurrence numbers, not one.** *Empirical* is the actual average gap between past "
+            "exceedance days in this ticker's own history. *Model* comes from fitting a Student-t distribution "
+            "to its z-scores (captures fat tails) and inverting the tail probability — more stable on names "
+            "with very few historical exceedances, where the empirical average is noisy or undefined (shown "
+            "as — when there are fewer than 2).\n"
+            "- **⚠️ The 'overdue' ratio is NOT a forecast on its own.** If big moves were truly independent "
+            "day to day, being overdue changes nothing going forward — the same logic as a coin not owing you "
+            "tails after ten heads in a row. What legitimately CAN matter is the **vol compression ratio**: "
+            "current rolling realized vol vs. this ticker's own full-sample average. A ratio well below 1 "
+            "means vol has genuinely dropped, and volatility is mean-reverting — that's real evidence, unlike "
+            "the raw day-count alone. Read the overdue ratio and vol compression together; the day count by "
+            "itself is not a probability."
+        )
+
+    held_symbols = set()
+    if not d["equity_positions"].empty:
+        held_symbols |= set(d["equity_positions"]["symbol"])
+    if not d["option_positions"].empty:
+        held_symbols |= set(d["option_positions"]["symbol"])
+    default_tickers = ", ".join(sorted(held_symbols)) if held_symbols else ", ".join(data_fetch.get_vol_tickers())
+
+    with st.form("sigma_screener_inputs"):
+        c1, c2, c3 = st.columns(3)
+        tickers_input = c1.text_input("Tickers (comma-separated)", value=default_tickers)
+        span = c2.selectbox(
+            "Lookback", ["3month", "year", "5year"], index=2,
+            format_func=lambda s: {"3month": "3 months", "year": "1 year", "5year": "5 years"}[s],
+        )
+        window = int(c3.number_input(
+            "Rolling vol window (days)", min_value=5, max_value=60, value=sigma_moves.DEFAULT_ROLLING_WINDOW, step=5,
+        ))
+        submitted = st.form_submit_button("Run screener", type="primary")
+
+    if not submitted:
+        st.info("Enter tickers above and click Run screener.")
+        return
+
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    if not tickers:
+        st.error("Enter at least one ticker.")
+        return
+
+    rows = []
+    skipped = []
+    for ticker in tickers:
+        try:
+            hist = fetch_price_history_span(ticker, span)
+        except Exception as exc:
+            skipped.append(f"{ticker} ({exc})")
+            continue
+        if hist.empty:
+            skipped.append(f"{ticker} (no price history)")
+            continue
+
+        close = hist["close"]
+        s2 = sigma_moves.analyze_symbol(ticker, close, threshold=2.0, window=window)
+        s3 = sigma_moves.analyze_symbol(ticker, close, threshold=3.0, window=window)
+        if s2 is None or s3 is None:
+            skipped.append(f"{ticker} (not enough history for a {window}-day rolling window)")
+            continue
+
+        rows.append(
+            {
+                "symbol": ticker,
+                "days observed": s2.n_observations,
+                "2σ count": s2.n_exceedances,
+                "2σ empirical avg days": s2.empirical_avg_days_between,
+                "2σ model avg days": s2.model_avg_days_between,
+                "2σ days since last": s2.days_since_last_exceedance,
+                "2σ overdue ratio": s2.overdue_ratio,
+                "3σ count": s3.n_exceedances,
+                "3σ empirical avg days": s3.empirical_avg_days_between,
+                "3σ model avg days": s3.model_avg_days_between,
+                "3σ days since last": s3.days_since_last_exceedance,
+                "3σ overdue ratio": s3.overdue_ratio,
+                "vol compression (recent/full)": s2.current_vol_ratio,
+                "fitted t df (2σ fit)": s2.fitted_t_df,
+            }
+        )
+
+    if skipped:
+        st.caption("Skipped: " + "; ".join(skipped))
+    if not rows:
+        st.warning("No tickers produced usable results.")
+        return
+
+    table = pd.DataFrame(rows).sort_values("2σ overdue ratio", ascending=False, na_position="last")
+    table["watch (overdue + compressed)"] = (table["2σ overdue ratio"].fillna(0) > 1) & (
+        table["vol compression (recent/full)"].fillna(1) < 0.85
+    )
+
+    st.markdown("##### Screener results")
+    st.caption(
+        "Sorted by 2σ overdue ratio, descending — click a column header to re-sort. \"Watch\" flags rows where "
+        "the overdue ratio AND vol compression agree (the combination with an actual evidence-based case "
+        "behind it, per the methodology above), not the day count alone."
+    )
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "2σ empirical avg days": st.column_config.NumberColumn(format="%.1f"),
+            "2σ model avg days": st.column_config.NumberColumn(format="%.1f"),
+            "2σ overdue ratio": st.column_config.NumberColumn(format="%.2f"),
+            "3σ empirical avg days": st.column_config.NumberColumn(format="%.1f"),
+            "3σ model avg days": st.column_config.NumberColumn(format="%.1f"),
+            "3σ overdue ratio": st.column_config.NumberColumn(format="%.2f"),
+            "vol compression (recent/full)": st.column_config.NumberColumn(format="%.2f"),
+            "fitted t df (2σ fit)": st.column_config.NumberColumn(
+                format="%.1f",
+                help="Lower = fatter tails (more prone to big moves than a normal distribution predicts). "
+                "Below ~10 is a common rule of thumb for 'tails matter here.'",
+            ),
+        },
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_expirations(symbol: str):
     return data_fetch.get_option_chain_expirations(symbol)
@@ -586,6 +724,8 @@ def render_vol_skew(d: dict):
     if chain.empty:
         st.warning("No quoted contracts returned for this expiration.")
         return
+
+    oi_history.log_snapshot(symbol, expiration, chain)
 
     st.markdown("##### Live underlying quote")
     render_live_quote(symbol)
@@ -688,6 +828,161 @@ def render_vol_skew(d: dict):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig_spread, use_container_width=True)
+
+    st.markdown("##### Open interest × volume by strike")
+    st.caption(
+        "Open interest alone shows where positions have built up over time; volume alone only shows today's "
+        "activity. Multiplying them highlights strikes with BOTH — a large existing book AND real trading "
+        "today — rather than a strike that's merely old-and-static or merely noisy-today. This is a raw "
+        "activity-intensity measure, not \"max pain\" (a different, specific calculation based on option "
+        "writers' assignment cost) — don't conflate the two."
+    )
+    chain_activity = chain.copy()
+    chain_activity["oi_volume"] = chain_activity["open_interest"] * chain_activity["volume"]
+    calls_activity = chain_activity[chain_activity["type"] == "call"]
+    puts_activity = chain_activity[chain_activity["type"] == "put"]
+
+    fig_oi = go.Figure()
+    fig_oi.add_trace(
+        go.Bar(
+            x=calls_activity["strike"], y=calls_activity["oi_volume"], name="Calls",
+            marker=dict(color=colors.CATEGORICAL[0]),
+            customdata=calls_activity[["open_interest", "volume"]],
+            hovertemplate="Strike $%{x:.2f}<br>OI×Vol %{y:,.0f}<br>OI %{customdata[0]:,.0f} · Vol %{customdata[1]:,.0f}<extra>Call</extra>",
+        )
+    )
+    fig_oi.add_trace(
+        go.Bar(
+            x=puts_activity["strike"], y=puts_activity["oi_volume"], name="Puts",
+            marker=dict(color=colors.CATEGORICAL[5]),
+            customdata=puts_activity[["open_interest", "volume"]],
+            hovertemplate="Strike $%{x:.2f}<br>OI×Vol %{y:,.0f}<br>OI %{customdata[0]:,.0f} · Vol %{customdata[1]:,.0f}<extra>Put</extra>",
+        )
+    )
+    if not held.empty:
+        held = held.copy()
+        held["oi_volume"] = held["open_interest"] * held["volume"]
+    oi_marker = held_marker_trace("oi_volume", "OI×Vol", ",.0f")
+    if oi_marker:
+        fig_oi.add_trace(oi_marker)
+    if spot and (not chain_activity.empty):
+        fig_oi.add_vline(x=spot, line=dict(color=colors.INK_MUTED, dash="dash", width=1), annotation_text="Mark", annotation_position="top")
+    if not chain_activity.empty and chain_activity["oi_volume"].max() > 0:
+        top_row = chain_activity.loc[chain_activity["oi_volume"].idxmax()]
+        fig_oi.add_vline(
+            x=top_row["strike"], line=dict(color=colors.STATUS_GOOD, dash="dot", width=1.5),
+            annotation_text=f"Most active ${top_row['strike']:,.2f}", annotation_position="bottom",
+        )
+    fig_oi.update_layout(
+        height=360,
+        margin=dict(l=10, r=10, t=10, b=10),
+        barmode="group",
+        plot_bgcolor=colors.SURFACE,
+        paper_bgcolor=colors.SURFACE,
+        xaxis=dict(title="Strike", showgrid=False, color=colors.INK_MUTED),
+        yaxis=dict(title="Open interest × volume", showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_oi, use_container_width=True)
+
+    oi_hist = oi_history.load_history(symbol, expiration)
+    n_days_logged = oi_hist["date"].nunique() if not oi_hist.empty else 0
+
+    st.markdown("##### Day-over-day change in open interest")
+    st.caption(
+        "Robinhood only exposes a current OI snapshot, not history — this builds up from a local log captured "
+        "each time you view this ticker+expiration, starting today. It only grows on days you actually check "
+        "back, so a gap can span more than one calendar day — that's shown per bar, not hidden."
+    )
+    if n_days_logged < 2:
+        st.info(
+            f"Logging started — {n_days_logged} day logged so far for {symbol} {expiration}. "
+            "Come back another day (view this same ticker + expiration again) to see day-over-day changes."
+        )
+    else:
+        changes = oi_history.daily_oi_change(oi_hist)
+        latest_date = changes["date"].max()
+        latest = changes[changes["date"] == latest_date].dropna(subset=["oi_change"])
+        if latest.empty:
+            st.caption("No comparable prior snapshot for any strike on the latest logged date yet.")
+        else:
+            gap_days = int(latest["days_since_prior"].iloc[0]) if pd.notna(latest["days_since_prior"].iloc[0]) else None
+            gap_note = f" (spanning {gap_days} day(s) since the prior snapshot)" if gap_days and gap_days != 1 else ""
+            st.caption(f"Latest logged date: {latest_date.date()}{gap_note}.")
+            latest_calls = latest[latest["type"] == "call"]
+            latest_puts = latest[latest["type"] == "put"]
+            bar_colors_calls = [colors.DIVERGING_POS if v >= 0 else colors.DIVERGING_NEG for v in latest_calls["oi_change"]]
+            bar_colors_puts = [colors.DIVERGING_POS if v >= 0 else colors.DIVERGING_NEG for v in latest_puts["oi_change"]]
+            fig_change = go.Figure()
+            fig_change.add_trace(
+                go.Bar(
+                    x=latest_calls["strike"], y=latest_calls["oi_change"], name="Calls",
+                    marker=dict(color=bar_colors_calls),
+                    customdata=latest_calls[["oi_pct_change"]],
+                    hovertemplate="Strike $%{x:.2f}<br>Δ OI %{y:+,.0f}<br>%{customdata[0]:+.1%}<extra>Call</extra>",
+                )
+            )
+            fig_change.add_trace(
+                go.Bar(
+                    x=latest_puts["strike"], y=latest_puts["oi_change"], name="Puts",
+                    marker=dict(color=bar_colors_puts, opacity=0.65),
+                    customdata=latest_puts[["oi_pct_change"]],
+                    hovertemplate="Strike $%{x:.2f}<br>Δ OI %{y:+,.0f}<br>%{customdata[0]:+.1%}<extra>Put</extra>",
+                )
+            )
+            fig_change.add_hline(y=0, line=dict(color=colors.INK_MUTED, width=1))
+            if spot:
+                fig_change.add_vline(x=spot, line=dict(color=colors.INK_MUTED, dash="dash", width=1), annotation_text="Mark", annotation_position="top")
+            fig_change.update_layout(
+                height=340,
+                margin=dict(l=10, r=10, t=10, b=10),
+                barmode="group",
+                plot_bgcolor=colors.SURFACE,
+                paper_bgcolor=colors.SURFACE,
+                xaxis=dict(title="Strike", showgrid=False, color=colors.INK_MUTED),
+                yaxis=dict(title="Δ Open interest", showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED, zerolinecolor=colors.INK_MUTED),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_change, use_container_width=True)
+            st.caption("Calls shown solid, puts shown at reduced opacity — green = OI increased since the prior snapshot, red = decreased. Bar height is the raw contract count change; hover for the % change.")
+
+    st.markdown("##### Open interest surface — strike × time")
+    st.caption(
+        "A true 'live' 3D view of how OI has actually moved, not a single-day snapshot — fills in as more days "
+        f"get logged. {n_days_logged} day(s) logged for {symbol} {expiration} so far."
+    )
+    if n_days_logged < 2:
+        st.info("Need at least 2 logged days to draw a surface — check back on another day this chain is viewed.")
+    else:
+        surface_type = st.radio("Side", ["call", "put"], key="oi_surface_type", horizontal=True)
+        side_hist = oi_hist[oi_hist["type"] == surface_type]
+        pivot = side_hist.pivot_table(index="date", columns="strike", values="open_interest", aggfunc="last")
+        pivot = pivot.sort_index()
+        if pivot.shape[0] < 2 or pivot.shape[1] < 2:
+            st.caption("Not enough (date × strike) coverage yet to render a surface for this side.")
+        else:
+            fig_surface = go.Figure(
+                data=go.Surface(
+                    x=pivot.columns,
+                    y=pivot.index,
+                    z=pivot.values,
+                    colorscale=[[0, colors.SURFACE_RAISED], [0.5, colors.CATEGORICAL[1]], [1, colors.CATEGORICAL[0]]],
+                    colorbar=dict(title="OI"),
+                    hovertemplate="Strike $%{x:.2f}<br>%{y}<br>OI %{z:,.0f}<extra></extra>",
+                )
+            )
+            fig_surface.update_layout(
+                height=600,
+                margin=dict(l=0, r=0, t=20, b=0),
+                paper_bgcolor=colors.SURFACE,
+                scene=dict(
+                    xaxis=dict(title="Strike", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+                    yaxis=dict(title="Date", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+                    zaxis=dict(title="Open interest", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+                    camera=dict(eye=dict(x=1.6, y=-1.6, z=0.9)),
+                ),
+            )
+            st.plotly_chart(fig_surface, use_container_width=True)
 
     st.dataframe(
         chain,
@@ -1980,9 +2275,9 @@ def main():
 
     tabs = st.tabs(
         [
-            "Overview", "Positions & Greeks", "Vol Exposure", "Portfolio Risk", "Vol Skew", "Risk Tool",
-            "Spread Selector", "Strategy Payoff", "Options Lab", "Delta Hedge", "Orders & History", "Win Rate",
-            "Journal / Export",
+            "Overview", "Positions & Greeks", "Vol Exposure", "Portfolio Risk", "Sigma Screener", "Vol Skew",
+            "Risk Tool", "Spread Selector", "Strategy Payoff", "Options Lab", "Delta Hedge", "Orders & History",
+            "Win Rate", "Journal / Export",
         ]
     )
     with tabs[0]:
@@ -1994,24 +2289,26 @@ def main():
     with tabs[3]:
         render_portfolio_risk(d)
     with tabs[4]:
-        render_vol_skew(d)
+        render_sigma_screener(d)
     with tabs[5]:
+        render_vol_skew(d)
+    with tabs[6]:
         render_risk_tool(d)
         st.divider()
         render_position_monitor(d)
-    with tabs[6]:
-        render_spread_selector(d)
     with tabs[7]:
-        render_strategy_payoff(d)
+        render_spread_selector(d)
     with tabs[8]:
-        render_options_lab(d)
+        render_strategy_payoff(d)
     with tabs[9]:
-        render_delta_hedge(d)
+        render_options_lab(d)
     with tabs[10]:
-        render_orders(d)
+        render_delta_hedge(d)
     with tabs[11]:
-        render_win_rate(d)
+        render_orders(d)
     with tabs[12]:
+        render_win_rate(d)
+    with tabs[13]:
         render_journal(d)
 
 

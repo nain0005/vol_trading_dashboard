@@ -114,7 +114,8 @@ def held_contracts_in_chain(
     option_positions: pd.DataFrame, chain: pd.DataFrame, symbol: str, expiration: str
 ) -> pd.DataFrame:
     """Your open option positions that fall within the given chain lookup,
-    so they can be marked on the skew/spread charts for that underlying+expiration."""
+    so they can be marked on the skew/spread/open-interest charts for that
+    underlying+expiration."""
     if option_positions.empty or chain.empty:
         return option_positions.iloc[0:0]
 
@@ -122,7 +123,10 @@ def held_contracts_in_chain(
     if held.empty:
         return held
 
-    return held.merge(chain[["strike", "type", "iv", "spread", "spread_pct", "mid"]], on=["strike", "type"], how="left")
+    return held.merge(
+        chain[["strike", "type", "iv", "spread", "spread_pct", "mid", "open_interest", "volume"]],
+        on=["strike", "type"], how="left",
+    )
 
 
 def book_underlyings(equity_positions: pd.DataFrame, option_positions: pd.DataFrame) -> list[str]:
