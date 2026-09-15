@@ -139,6 +139,30 @@ def test_find_best_spreads_rejects_unknown_strategy():
         find_best_spreads("iron_condor", chain, S, T, r, q, strike_increment=5.0)
 
 
+def test_prob_profit_is_none_not_a_crash_when_net_debit_exactly_equals_spread_width():
+    # Found via streamlit.testing.v1.AppTest exercising the live Spread
+    # Selector form against demo-mode AAPL data (2026-09-18 expiration):
+    # when net_debit exactly equals the spread width, max_profit is
+    # exactly 0 at spot=$0 (both puts fully in the money: payoff there is
+    # width - net_debit = 0) -- option_strategy.analyze_strategy correctly
+    # treats that as a zero-crossing and reports breakevens=[0.0, ...],
+    # which is mathematically real but not a valid Black-Scholes strike
+    # (compute_d1_d2 requires S and K strictly positive). This crashed
+    # with "S and K must be positive" inside itm_probability before the
+    # <= 0 guard existed. Reproduced here with the exact real premiums
+    # that triggered it, not a hand-constructed approximation.
+    chain = pd.DataFrame([
+        {"strike": 100.0, "type": "put", "iv": 0.198160, "mid": 12.180},
+        {"strike": 95.0, "type": "put", "iv": 0.196956, "mid": 7.180},
+    ])
+    spot = 87.75595402838555
+    cand = evaluate_candidate("bear_put_spread", [("long", "put", 100.0), ("short", "put", 95.0)], chain, spot, 5 / 365.0, 0.05, 0.0)
+    assert cand is not None
+    assert cand.max_profit == pytest.approx(0.0, abs=1e-6)  # confirms this test hits the exact degenerate case
+    assert cand.breakevens[0] == pytest.approx(0.0, abs=1e-6)
+    assert cand.prob_profit is None  # not a crash, not a silently wrong number
+
+
 def test_min_risk_reward_flags_poor_setup():
     chain = _make_chain()
     strict_config = RiskConfig(min_risk_reward_ratio=100.0)  # nothing will clear this bar

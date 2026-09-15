@@ -80,18 +80,25 @@ def _to_option_legs(resolved: list[tuple[str, ChainLeg]]) -> list[OptionLeg]:
 
 
 def _prob_profit(strategy: str, breakevens: list[float], S: float, T: float, r: float, q: float, blended_iv: float) -> float | None:
+    """None means "undefined", not "zero" -- e.g. a breakeven at or below
+    $0 (possible with a deep/degenerate spread, or loose synthetic demo
+    IVs that don't enforce a realistic no-arbitrage relationship between
+    strikes) isn't a strike Black-Scholes can price against; itm_probability
+    requires a strictly positive strike, so guard rather than crash."""
     if strategy == "bear_put_spread":
-        if len(breakevens) < 1:
+        if len(breakevens) < 1 or breakevens[0] <= 0:
             return None
         return itm_probability(S, breakevens[0], T, r, q, blended_iv, "put")
     if strategy == "bull_put_spread":
-        if len(breakevens) < 1:
+        if len(breakevens) < 1 or breakevens[0] <= 0:
             return None
         return itm_probability(S, breakevens[0], T, r, q, blended_iv, "call")
     if strategy in ("straddle", "strangle"):
         if len(breakevens) < 2:
             return None
         lo, hi = min(breakevens), max(breakevens)
+        if lo <= 0 or hi <= 0:
+            return None
         return itm_probability(S, lo, T, r, q, blended_iv, "put") + itm_probability(S, hi, T, r, q, blended_iv, "call")
     return None
 
