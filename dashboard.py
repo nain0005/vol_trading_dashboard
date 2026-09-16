@@ -2200,14 +2200,264 @@ _HEDGE_PRESETS = {
 }
 
 
+def _importable_single_positions(d: dict) -> list[dict]:
+    """Flat list of single-instrument positions (one equity holding, or one
+    option leg) that the beta-hedge mode can import to auto-fill the
+    'position to hedge' side, instead of typing ticker/qty/delta by hand.
+    Deliberately single-leg (not aggregated across legs) — beta-hedge sizes
+    against ONE delta-equivalent exposure number, unlike the same-underlying
+    mode below which aggregates multiple legs via strategy_greeks."""
+    importable: list[dict] = []
+    eq = d["equity_positions"]
+    if not eq.empty:
+        for _, row in eq.iterrows():
+            qty = float(row["quantity"])
+            side = "long" if qty >= 0 else "short"
+            importable.append({
+                "label": f"{row['symbol']} — {abs(qty):.0f} shares ({side})",
+                "ticker": row["symbol"],
+                "kind": "share",
+                "qty": abs(qty),
+                "side": side,
+            })
+    opt = d["option_positions"]
+    if not opt.empty:
+        for _, row in opt.iterrows():
+            importable.append({
+                "label": f"{row['symbol']} {row['side']} {row['quantity']:.0f}x ${row['strike']:.2f}{row['type'][0].upper()} exp {row['expiration']}",
+                "ticker": row["symbol"],
+                "kind": "option",
+                # get_option_positions()/demo_data's equivalent already store "delta" pre-weighted by signed
+                # quantity and the 100x multiplier (i.e. it IS the delta-equivalent share exposure, same units
+                # hedge.option_position_exposure_shares returns) — use it directly rather than re-deriving a
+                # raw per-contract delta and re-multiplying, which would just reintroduce the same sign-
+                # convention ambiguity hedge.option_position_exposure_shares's own docstring calls out.
+                "exposure_shares": float(row["delta"]),
+            })
+    return importable
+
+
 def render_delta_hedge(d: dict):
     st.subheader("Delta hedge builder")
     st.caption(
+        "Two different things both get called 'delta hedging': flattening an OPTIONS POSITION'S OWN delta "
+        "with shares of its same underlying (the classic, textbook meaning — ratio is exactly 1), or offsetting "
+        "a position's directional risk with a DIFFERENT correlated instrument sized by historical beta (useful "
+        "when the position's own underlying isn't practical to trade, or you want a liquid proxy). Pick the "
+        "mode that matches what you're actually trying to do."
+    )
+    hedge_method = st.radio(
+        "Hedge method",
+        ["Same underlying (classic delta-neutral)", "Cross-asset (beta hedge)"],
+        key="hedge_method", horizontal=True,
+    )
+    st.divider()
+    if hedge_method == "Same underlying (classic delta-neutral)":
+        _render_same_underlying_hedge(d)
+    else:
+        _render_beta_hedge(d)
+
+
+def _render_same_underlying_hedge(d: dict):
+    st.markdown("##### Same-underlying delta-neutral hedge")
+    st.caption(
+        "Flattens an options position's NET delta with shares of its own underlying. No beta, no price-ratio "
+        "conversion — a share moves $1-for-$1 with itself by definition, so the hedge is exactly the "
+        "sign-flipped net delta. Supports multiple legs on the same underlying/expiration, aggregated to one "
+        "net delta the same way the Options Lab tab does (reuses the same strategy_greeks function)."
+    )
+    with st.expander("What this does and doesn't do", expanded=False):
+        st.markdown(
+            "- Only offsets **delta** (directional risk). Theta, vega, and every other Greek are untouched — "
+            "this is not a way to eliminate an options position's other risks.\n"
+            "- The hedge is exact **only at this instant**. Gamma means net delta itself moves as spot moves — "
+            "the rebalancing curve below shows how far this position's hedge need drifts before it's stale, "
+            "so you can judge how often you'd realistically need to revisit it.\n"
+            "- Every leg is assumed to share **one expiration** — the aggregation uses one time-to-expiration "
+            "for all legs, so a calendar spread's two different expirations would need two separate hedge "
+            "calculations run separately, not one combined number here."
+        )
+
+    source = st.radio("Position source", ["Build manually", "Import an open position"], key="hedge_su_source", horizontal=True)
+
+    active = None
+    if source == "Build manually":
+        with st.form("hedge_su_manual_inputs"):
+            c1, c2, c3 = st.columns(3)
+            m_symbol = c1.text_input(
+                "Underlying (for spot price + centering)", value=st.session_state.get("skew_symbol_input", ""), key="hedge_su_symbol",
+            ).strip().upper()
+            m_dte = int(c2.number_input("Days to expiration", min_value=1, value=30, step=1, key="hedge_su_dte"))
+            n_legs = int(c3.number_input("Number of legs", min_value=1, max_value=4, value=1, step=1, key="hedge_su_nlegs"))
+            leg_inputs = []
+            for i in range(n_legs):
+                st.markdown(f"###### Leg {i + 1}")
+                lc1, lc2, lc3, lc4, lc5, lc6 = st.columns(6)
+                leg_side = lc1.selectbox("Side", ["Long", "Short"], key=f"hedge_su_leg_side_{i}")
+                leg_type = lc2.selectbox("Type", ["Call", "Put"], key=f"hedge_su_leg_type_{i}")
+                leg_strike = lc3.number_input("Strike ($)", min_value=0.0, value=0.0, step=0.5, key=f"hedge_su_leg_strike_{i}")
+                leg_premium = lc4.number_input("Premium ($/share)", min_value=0.0, value=0.0, step=0.01, key=f"hedge_su_leg_premium_{i}")
+                leg_contracts = lc5.number_input("Contracts", min_value=1.0, value=1.0, step=1.0, key=f"hedge_su_leg_contracts_{i}")
+                leg_iv = lc6.number_input("IV (%)", min_value=0.1, value=30.0, step=1.0, key=f"hedge_su_leg_iv_{i}")
+                leg_inputs.append((leg_side, leg_type, leg_strike, leg_premium, leg_contracts, leg_iv))
+            submitted = st.form_submit_button("Build", type="primary", key="hedge_su_build_btn")
+        if submitted:
+            built_legs = [
+                {"option_type": t.lower(), "strike": k, "premium": p, "contracts": (c if s == "Long" else -c), "iv": iv / 100.0}
+                for s, t, k, p, c, iv in leg_inputs
+                if k > 0
+            ]
+            if not built_legs:
+                st.error("Enter at least one leg with a strike > 0.")
+            else:
+                st.session_state["hedge_su_manual_strategy"] = {"legs": built_legs, "underlying_symbol": m_symbol, "dte": m_dte}
+        active = st.session_state.get("hedge_su_manual_strategy")
+        if not active:
+            st.info("Fill in the legs above and click Build.")
+            return
+    else:  # Import an open position
+        opt = d["option_positions"]
+        combos = []
+        if not opt.empty:
+            for (symbol, expiration), group in opt.groupby(["symbol", "expiration"]):
+                combos.append((symbol, expiration, group))
+        if not combos:
+            st.caption("No open option positions to import.")
+            return
+        labels = [f"{symbol} exp {expiration} ({len(group)} leg(s))" for symbol, expiration, group in combos]
+        idx = st.selectbox("Position", range(len(labels)), format_func=lambda i: labels[i], key="hedge_su_position_select")
+        symbol, expiration, group = combos[idx]
+        built_legs = [
+            {
+                "option_type": row["type"], "strike": float(row["strike"]), "premium": abs(float(row["avg_price"])),
+                "contracts": float(row["quantity"]) if row["side"] == "long" else -float(row["quantity"]),
+                "iv": float(row["implied_volatility"]) if pd.notna(row["implied_volatility"]) and row["implied_volatility"] > 0 else None,
+            }
+            for _, row in group.iterrows()
+        ]
+        dte_val = int(group["dte"].iloc[0]) if pd.notna(group["dte"].iloc[0]) else 30
+        if not all(leg["iv"] is not None for leg in built_legs):
+            st.warning("One or more legs on this position are missing a live IV — this hedge needs it on every leg.")
+            return
+        active = {"legs": built_legs, "underlying_symbol": symbol, "dte": dte_val}
+
+    legs = [option_strategy.OptionLeg(**leg) for leg in active["legs"]]
+    underlying_symbol = active["underlying_symbol"]
+    dte = active["dte"]
+
+    spot = None
+    if underlying_symbol:
+        try:
+            spot = data_fetch.get_stock_quote(underlying_symbol)["mark"]
+        except Exception:
+            spot = None
+    if not spot:
+        strikes = [leg.strike for leg in legs]
+        spot = sum(strikes) / len(strikes)
+        st.caption(f"No live quote for {underlying_symbol or 'this underlying'} — centering on the average strike (${spot:,.2f}) instead.")
+
+    config = DEFAULT_CONFIG
+    T_years = dte / 365.0
+
+    greeks = options_lab.strategy_greeks(legs, spot, T_years, config.risk_free_rate, config.dividend_yield)
+    net_delta = greeks["delta"]
+    hedge_shares = hedge.same_underlying_hedge_shares(net_delta)
+
+    st.markdown("##### Result")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Net delta (shares-equiv.)", f"{net_delta:+,.1f}")
+    c2.metric("Net gamma", f"{greeks['gamma']:+.4f}", help="Rate net delta changes per $1 move in the underlying — how fast the hedge below goes stale.")
+    c3.metric("Net theta/day", money(greeks["theta"]))
+    c4.metric("Net vega", f"{greeks['vega']:+.2f}")
+
+    if abs(hedge_shares) < 0.05:
+        st.info("Net delta is already ~0 — no share hedge needed right now.")
+    else:
+        action = "Sell / go short" if hedge_shares < 0 else "Buy / go long"
+        st.success(
+            f"**{action} {abs(hedge_shares):,.1f} shares of {underlying_symbol or 'the underlying'}** "
+            "to bring this position's net delta to (approximately) zero right now."
+        )
+
+    st.markdown("##### Hedge shares needed vs. spot (gamma-aware rebalancing curve)")
+    st.caption(
+        "Net delta isn't constant — gamma is the rate it changes as spot moves. This is the exact hedge-shares-"
+        "needed value AT each spot level, holding time and vol fixed at today's — i.e. how far the hedge above "
+        "would need to shift before it's stale, not a forecast of where spot is headed. Reuses "
+        "options_lab.greeks_curve (the same delta-vs-spot math the Options Lab tab plots) rather than a new "
+        "calculation."
+    )
+    spot_range_pct = st.slider("Spot range (± % around current)", min_value=0.05, max_value=0.50, value=0.20, step=0.05, key="hedge_su_range")
+    curve = options_lab.greeks_curve(legs, spot, T_years, config.risk_free_rate, config.dividend_yield, spot_range_pct=spot_range_pct)
+    curve["hedge_shares"] = -curve["delta"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=curve["spot"], y=curve["hedge_shares"], mode="lines", line=dict(color=colors.CATEGORICAL[0], width=2.5), name="Hedge shares needed"))
+    fig.add_hline(y=0, line=dict(color=colors.INK_MUTED, dash="dash", width=1))
+    if spot:
+        fig.add_vline(x=spot, line=dict(color=colors.STATUS_WARNING, dash="dot", width=1.5), annotation_text="Spot now", annotation_position="top")
+    fig.update_layout(
+        height=340,
+        margin=dict(l=10, r=10, t=20, b=10),
+        plot_bgcolor=colors.SURFACE,
+        paper_bgcolor=colors.SURFACE,
+        xaxis=dict(title="Underlying price ($)", showgrid=False, color=colors.INK_MUTED),
+        yaxis=dict(title="Shares needed to be delta-neutral", showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+    )
+    st.plotly_chart(fig, use_container_width=True, key="hedge_su_curve")
+
+    fig_gamma = go.Figure()
+    fig_gamma.add_trace(go.Scatter(x=curve["spot"], y=curve["gamma"], mode="lines", line=dict(color=colors.CATEGORICAL[1], width=2)))
+    if spot:
+        fig_gamma.add_vline(x=spot, line=dict(color=colors.INK_MUTED, dash="dash", width=1))
+    fig_gamma.update_layout(
+        height=220,
+        margin=dict(l=10, r=10, t=30, b=10),
+        plot_bgcolor=colors.SURFACE,
+        paper_bgcolor=colors.SURFACE,
+        title=dict(text="Gamma vs. spot — why the curve above is curved", font=dict(size=13)),
+        xaxis=dict(title="Underlying price ($)", showgrid=False, color=colors.INK_MUTED),
+        yaxis=dict(showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+    )
+    st.plotly_chart(fig_gamma, use_container_width=True, key="hedge_su_gamma")
+    st.caption("Higher |gamma| = the hedge-shares curve above is steeper there = more rebalancing needed if spot lingers in that zone.")
+
+    st.markdown("##### Stress test: hedged vs. unhedged")
+    st.caption(
+        "Position P&L is the exact mark-to-market repricing (Black-Scholes at each leg's own IV — same engine "
+        "as Strategy Payoff/Options Lab). Hedge P&L assumes the share hedge above stays fixed through the "
+        "shock — exactly why the rebalancing curve matters for a big move, since gamma means the 'right' hedge "
+        "size at the shocked price isn't the same one you started with."
+    )
+    shocks = [-0.10, -0.05, 0.0, 0.05, 0.10]
+    stress_rows = []
+    for shock in shocks:
+        shocked_spot = spot * (1 + shock)
+        position_pl = option_strategy.strategy_pl_today(legs, shocked_spot, T_years, config.risk_free_rate, config.dividend_yield)
+        hedge_pl = hedge_shares * (shocked_spot - spot)
+        stress_rows.append({
+            "underlying move": f"{shock:+.0%}", "shocked spot": shocked_spot,
+            "position P&L": position_pl, "hedge P&L": hedge_pl, "combined P&L": position_pl + hedge_pl,
+        })
+    st.dataframe(
+        pd.DataFrame(stress_rows), use_container_width=True, hide_index=True,
+        column_config={
+            "shocked spot": st.column_config.NumberColumn(format="$%.2f"),
+            "position P&L": st.column_config.NumberColumn(format="$%.2f"),
+            "hedge P&L": st.column_config.NumberColumn(format="$%.2f"),
+            "combined P&L": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
+
+
+def _render_beta_hedge(d: dict):
+    st.markdown("##### Cross-asset beta hedge")
+    st.caption(
         "Sizes a hedge in a *different* instrument (an ETF, a commodity proxy, a crypto) against a position's "
-        "delta-equivalent exposure, scaled by that instrument's historical beta to the position's underlying — "
-        "not a same-underlying options hedge. Useful when you want to offset directional risk with something "
-        "liquid you can actually trade (e.g. hedge an oil-sensitive equity position with USO, or a small-cap "
-        "growth book with XLM as a risk-appetite proxy)."
+        "delta-equivalent exposure, scaled by that instrument's historical beta to the position's underlying. "
+        "Useful when you want to offset directional risk with something liquid you can actually trade (e.g. "
+        "hedge an oil-sensitive equity position with USO, or a small-cap growth book with XLM as a "
+        "risk-appetite proxy)."
     )
     with st.expander("What this does and doesn't do", expanded=False):
         st.markdown(
@@ -2217,25 +2467,46 @@ def render_delta_hedge(d: dict):
             "idiosyncratic move; **R²** below tells you how much of the move the hedge instrument actually "
             "explains — a low R² means this hedge is doing much less than the notional suggests.\n"
             "- **Decays over time.** Option delta moves with spot/time (gamma/theta), and beta is a rolling "
-            "estimate that drifts — recompute and rebalance periodically, this isn't set-and-forget."
+            "estimate that drifts — recompute and rebalance periodically, this isn't set-and-forget. The "
+            "**beta stability** section below shows exactly how much that single beta number moves around "
+            "depending on which lookback window you happened to pick."
         )
 
     col_pos, col_hedge = st.columns(2)
 
     with col_pos:
         st.markdown("##### Position to hedge")
-        position_ticker = st.text_input("Underlying ticker", key="hedge_pos_ticker", placeholder="e.g. AXP").strip().upper()
-        position_mode = st.radio("Position type", ["Shares / ETF", "Option"], key="hedge_pos_mode", horizontal=True)
-        if position_mode == "Shares / ETF":
-            qty = st.number_input("Quantity (unsigned)", min_value=0.0, value=100.0, step=1.0, key="hedge_pos_qty")
-            side = st.selectbox("Side", ["long", "short"], key="hedge_pos_side")
+        position_source = st.radio("Position source", ["Manual entry", "Import an open position"], key="hedge_pos_source", horizontal=True)
+        position_ticker = None
+        exposure_shares = None
+        if position_source == "Import an open position":
+            importable = _importable_single_positions(d)
+            if not importable:
+                st.caption("No open equity/option positions to import.")
+            else:
+                idx = st.selectbox("Position", range(len(importable)), format_func=lambda i: importable[i]["label"], key="hedge_pos_import_select")
+                picked = importable[idx]
+                position_ticker = picked["ticker"]
+                exposure_shares = (
+                    hedge.share_position_exposure_shares(picked["qty"], picked["side"]) if picked["kind"] == "share" else picked["exposure_shares"]
+                )
+                st.info(f"Imported: {picked['label']} → delta-equivalent exposure {exposure_shares:+,.1f} shares.")
         else:
-            delta = st.number_input(
-                "Delta (signed — e.g. -0.45 for a long put, +0.30 for a short put)",
-                value=0.45, step=0.01, format="%.2f", key="hedge_pos_delta",
-            )
-            contracts = st.number_input("Contracts (unsigned)", min_value=0.0, value=1.0, step=1.0, key="hedge_pos_contracts")
-            contract_side = st.selectbox("Position side", ["long", "short"], key="hedge_pos_contract_side")
+            position_ticker = st.text_input("Underlying ticker", key="hedge_pos_ticker", placeholder="e.g. AXP").strip().upper()
+            position_mode = st.radio("Position type", ["Shares / ETF", "Option"], key="hedge_pos_mode", horizontal=True)
+            if position_mode == "Shares / ETF":
+                qty = st.number_input("Quantity (unsigned)", min_value=0.0, value=100.0, step=1.0, key="hedge_pos_qty")
+                side = st.selectbox("Side", ["long", "short"], key="hedge_pos_side")
+                exposure_shares = hedge.share_position_exposure_shares(qty, side)
+            else:
+                delta = st.number_input(
+                    "Delta (signed — e.g. -0.45 for a long put, +0.30 for a short put)",
+                    value=0.45, step=0.01, format="%.2f", key="hedge_pos_delta",
+                )
+                contracts = st.number_input("Contracts (unsigned)", min_value=0.0, value=1.0, step=1.0, key="hedge_pos_contracts")
+                contract_side = st.selectbox("Position side", ["long", "short"], key="hedge_pos_contract_side")
+                signed_contracts = contracts if contract_side == "long" else -contracts
+                exposure_shares = hedge.option_position_exposure_shares(delta, signed_contracts)
 
     with col_hedge:
         st.markdown("##### Hedge instrument")
@@ -2256,8 +2527,8 @@ def render_delta_hedge(d: dict):
             "quoted per unit.",
         )
 
-    if not position_ticker or not hedge_ticker:
-        st.caption("Enter both a position ticker and a hedge ticker to compute a hedge size.")
+    if not position_ticker or not hedge_ticker or exposure_shares is None:
+        st.caption("Pick/enter a position and a hedge ticker to compute a hedge size.")
         return
 
     if not st.button("Calculate hedge", type="primary", key="hedge_calculate"):
@@ -2305,12 +2576,6 @@ def render_delta_hedge(d: dict):
     except Exception:
         hedge_price = float(hedge_close.iloc[-1])
 
-    if position_mode == "Shares / ETF":
-        exposure_shares = hedge.share_position_exposure_shares(qty, side)
-    else:
-        signed_contracts = contracts if contract_side == "long" else -contracts
-        exposure_shares = hedge.option_position_exposure_shares(delta, signed_contracts)
-
     result = hedge.size_hedge(exposure_shares, underlying_price, beta_est.beta, hedge_price, multiplier)
 
     st.markdown("##### Result")
@@ -2345,6 +2610,90 @@ def render_delta_hedge(d: dict):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("##### Beta stability across lookback windows")
+    st.caption(
+        "The beta above is one point estimate over the lookback you picked. Re-estimating it over several "
+        "other trailing windows (same estimate_beta function, different slices of the SAME price history) "
+        "shows whether that number reflects a fairly constant relationship or is an artifact of the window "
+        "you happened to choose — a wide spread here is a real reason to size this hedge conservatively and "
+        "rebalance more often, not just a footnote."
+    )
+    full_underlying_returns = hedge.simple_returns(underlying_hist.set_index("date")["close"])
+    full_hedge_returns = hedge.simple_returns(hedge_hist.set_index("date")["close"])
+    window_betas = hedge.beta_across_windows(full_underlying_returns, full_hedge_returns, windows=(30, 60, 90, 180))
+    window_rows = [
+        {
+            "window (trading days)": w,
+            "beta": (est.beta if est else None),
+            "R²": (est.r_squared if est else None),
+            "n obs": (est.n_obs if est else None),
+        }
+        for w, est in window_betas.items()
+    ]
+    st.dataframe(
+        pd.DataFrame(window_rows), use_container_width=True, hide_index=True,
+        column_config={
+            "beta": st.column_config.NumberColumn(format="%.3f"),
+            "R²": st.column_config.NumberColumn(format="percent"),
+        },
+    )
+    valid_windows = [(w, est.beta) for w, est in window_betas.items() if est is not None]
+    if len(valid_windows) >= 2:
+        betas_only = [b for _, b in valid_windows]
+        beta_spread = max(betas_only) - min(betas_only)
+        fig_beta = go.Figure(
+            data=go.Bar(x=[str(w) for w, _ in valid_windows], y=betas_only, marker_color=colors.CATEGORICAL[0])
+        )
+        fig_beta.update_layout(
+            height=240,
+            margin=dict(l=10, r=10, t=20, b=10),
+            plot_bgcolor=colors.SURFACE,
+            paper_bgcolor=colors.SURFACE,
+            xaxis=dict(title="Lookback window (trading days)", color=colors.INK_MUTED),
+            yaxis=dict(title="Beta", showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+        )
+        st.plotly_chart(fig_beta, use_container_width=True, key="hedge_beta_stability_chart")
+        min_abs = min(abs(b) for b in betas_only)
+        unstable = beta_spread > 0.25 or (min_abs > 1e-9 and beta_spread / min_abs > 0.75)
+        if unstable:
+            st.warning(
+                f"Beta ranges from {min(betas_only):.2f} to {max(betas_only):.2f} across these windows — a "
+                "meaningfully unstable relationship. Treat the hedge size above as rough, and consider a "
+                "shorter rebalance interval."
+            )
+        else:
+            st.caption(f"Beta stays within a {beta_spread:.2f}-wide band across these windows — reasonably stable.")
+    else:
+        st.caption("Not enough overlapping price history to compare multiple lookback windows.")
+
+    st.markdown("##### Stress test: hedged vs. unhedged")
+    st.caption(
+        "Position P&L is exposure_shares × the underlying's price change from today (the same linear, "
+        "delta-only approximation the hedge sizing above already makes — exact for a share position, a local "
+        "approximation for an option one). The hedge instrument's shocked price is **modeled via beta** "
+        "(hedge move = beta × underlying move), not an independent observation — this illustrates what the "
+        "hedge is supposed to do assuming that relationship holds through the shock, not a forecast of either "
+        "price."
+    )
+    shocks = [-0.10, -0.05, 0.0, 0.05, 0.10]
+    stress_rows = []
+    for shock in shocks:
+        shocked_underlying_price = underlying_price * (1 + shock)
+        shocked_hedge_price = hedge_price * (1 + beta_est.beta * shock)
+        position_pl = hedge.share_position_pl(shocked_underlying_price, underlying_price, exposure_shares)
+        hedge_pl = hedge.hedge_instrument_pl(shocked_hedge_price, hedge_price, result.hedge_units)
+        stress_rows.append({
+            "underlying move": f"{shock:+.0%}", "position P&L": position_pl, "hedge P&L": hedge_pl, "combined P&L": position_pl + hedge_pl,
+        })
+    st.dataframe(
+        pd.DataFrame(stress_rows), use_container_width=True, hide_index=True,
+        column_config={
+            "position P&L": st.column_config.NumberColumn(format="$%.2f"),
+            "hedge P&L": st.column_config.NumberColumn(format="$%.2f"),
+            "combined P&L": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
 
 
 def render_orders(d: dict):
