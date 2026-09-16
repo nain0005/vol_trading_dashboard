@@ -528,6 +528,59 @@ def render_portfolio_risk(d: dict):
     if total_skipped:
         st.caption(f"{total_skipped} position(s) skipped in the stress test (missing live price, IV, or DTE).")
 
+    st.divider()
+    st.markdown("##### Stress surface — spot move × IV shock (independent grid)")
+    st.caption(
+        "The bar chart above ties the IV shock to the spot shock via one slider (the leverage-effect "
+        "assumption). This surface decouples them — every combination of spot move and IV shock, "
+        "independently — same book_stress_pl repricing as above, swept over two axes instead of one, so you "
+        "can see how much the total depends on vol shocking more or less than that fixed assumption."
+    )
+    gc1, gc2 = st.columns(2)
+    spot_shock_max = gc1.slider("Spot shock range (±%)", min_value=5, max_value=40, value=25, step=5, key="stress_surface_spot_range") / 100.0
+    # Slider is in "points" (percentage points, e.g. 15 -> IV +/- 15pp) for
+    # readability; book_stress_pl's iv_shock_pts is added directly onto IV's
+    # own 0-1 fraction scale (see option_leg_stress_pl / its test), so it
+    # needs the /100 fraction form, not the raw slider value.
+    iv_shock_max_points = gc2.slider("IV shock range (± points)", min_value=5, max_value=30, value=15, step=5, key="stress_surface_iv_range")
+    iv_shock_max_frac = iv_shock_max_points / 100.0
+
+    n_grid_points = 11
+    spot_shocks = np.linspace(-spot_shock_max, spot_shock_max, n_grid_points)
+    iv_shocks_frac = np.linspace(-iv_shock_max_frac, iv_shock_max_frac, n_grid_points)
+    z = np.zeros((n_grid_points, n_grid_points))
+    for i, iv_s in enumerate(iv_shocks_frac):
+        for j, sp_s in enumerate(spot_shocks):
+            grid_result = vol_analysis.book_stress_pl(
+                eq, opt, spot_by_symbol, float(sp_s), iv_shock_pts=float(iv_s),
+                r=config.risk_free_rate, q=config.dividend_yield,
+            )
+            z[i, j] = grid_result["total_pl"]
+
+    zmax_surface = float(np.abs(z).max()) or 1.0
+    fig_stress_surface = go.Figure(
+        data=go.Surface(
+            x=spot_shocks, y=iv_shocks_frac * 100.0, z=z,
+            colorscale=[[0, colors.DIVERGING_NEG], [0.5, colors.DIVERGING_MID], [1, colors.DIVERGING_POS]],
+            cmid=0, cmin=-zmax_surface, cmax=zmax_surface,
+            colorbar=dict(title="P&L ($)"),
+            hovertemplate="Spot move %{x:+.0%}<br>IV shock %{y:+.1f}pts<br>Total P&L $%{z:,.0f}<extra></extra>",
+        )
+    )
+    fig_stress_surface.update_layout(
+        height=560,
+        margin=dict(l=0, r=0, t=20, b=0),
+        paper_bgcolor=colors.SURFACE,
+        scene=dict(
+            xaxis=dict(title="Spot move", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED, tickformat=".0%"),
+            yaxis=dict(title="IV shock (points)", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+            zaxis=dict(title="Total book P&L ($)", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+            camera=dict(eye=dict(x=1.6, y=-1.6, z=0.9)),
+        ),
+    )
+    st.plotly_chart(fig_stress_surface, use_container_width=True)
+    st.caption("Positive IV shock = vol expands; negative = vol contracts. Applied uniformly across every option leg.")
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_price_history_span(symbol: str, span: str):
@@ -1005,6 +1058,9 @@ def render_vol_skew(d: dict):
     st.divider()
     render_term_structure(symbol, expirations, spot)
 
+    st.divider()
+    render_vol_surface(symbol, expirations, spot)
+
 
 @st.cache_data(ttl=3600, show_spinner="Pulling price history...")
 def fetch_price_history(symbol: str):
@@ -1103,6 +1159,79 @@ def render_term_structure(symbol: str, expirations: list, spot: float):
         c1.metric("Front-month ATM IV − 20d realized", f"{spread:+.1%}", help="Positive = options pricing more movement than has recently occurred (rich). Negative = cheap.")
         slope = ts.iloc[-1]["atm_iv"] - ts.iloc[0]["atm_iv"]
         c2.metric("Term structure slope (back − front)", f"{slope:+.1%}", help="Positive = contango (normal). Negative = backwardation (event risk priced near-term).")
+
+
+def render_vol_surface(symbol: str, expirations: list, spot: float):
+    """Full strike x expiration IV surface -- term structure above only
+    tracks ATM IV; this is the same idea extended across every strike at
+    once, the classic "vol surface" desks actually mean by that term.
+
+    Reuses fetch_chain per expiration (already cached), same as
+    render_term_structure just above -- so this is opt-in via its own
+    button rather than automatic, for the same reason: N expirations
+    means N full chain fetches.
+    """
+    st.markdown("##### Volatility surface — strike × expiration")
+    st.caption(
+        "IV at every strike across several expirations, not just ATM. Each expiration's curve uses the "
+        "OTM-stitched convention (put IV below spot, call IV at/above — the more liquid, less exercise-noisy "
+        "side) and is linearly interpolated onto one shared strike grid so expirations with different listed "
+        "strikes still line up; a gap in the surface means that expiration didn't quote anything near that "
+        "strike, not a real IV of zero."
+    )
+    max_available = min(12, len(expirations))
+    n = st.slider(
+        "Expirations to include", min_value=min(3, max_available), max_value=max_available,
+        value=min(6, max_available), key="vol_surface_n",
+    )
+    if st.button("Load vol surface", key="load_vol_surface"):
+        today = date.today()
+        curves = {}
+        for exp in expirations[:n]:
+            try:
+                chain = fetch_chain(symbol, exp)
+            except Exception:
+                continue
+            if chain.empty:
+                continue
+            curve = vol_analysis.otm_iv_curve(chain, spot)
+            dte = max((pd.Timestamp(exp).date() - today).days, 0)
+            curves[exp] = (dte, curve)
+        st.session_state["vol_surface_data"] = vol_analysis.vol_surface_grid(curves)
+        st.session_state["vol_surface_symbol"] = symbol
+
+    grid = st.session_state.get("vol_surface_data")
+    if grid is None or st.session_state.get("vol_surface_symbol") != symbol:
+        st.caption("Click **Load vol surface** to pull per-strike IV across the selected expirations.")
+        return
+    if grid.empty:
+        st.info("Need at least 2 expirations with 2+ quoted OTM strikes each to build a surface — try including more expirations.")
+        return
+
+    pivot = grid.pivot_table(index="dte", columns="strike", values="iv", aggfunc="mean").sort_index()
+    fig_surface = go.Figure(
+        data=go.Surface(
+            x=pivot.columns,
+            y=pivot.index,
+            z=pivot.values,
+            colorscale=[[0, colors.SURFACE_RAISED], [0.5, colors.CATEGORICAL[1]], [1, colors.CATEGORICAL[0]]],
+            colorbar=dict(title="IV", tickformat=".0%"),
+            hovertemplate="Strike $%{x:.2f}<br>DTE %{y}<br>IV %{z:.1%}<extra></extra>",
+        )
+    )
+    fig_surface.update_layout(
+        height=600,
+        margin=dict(l=0, r=0, t=20, b=0),
+        paper_bgcolor=colors.SURFACE,
+        scene=dict(
+            xaxis=dict(title="Strike", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+            yaxis=dict(title="Days to expiration", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+            zaxis=dict(title="Implied volatility", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED, tickformat=".0%"),
+            camera=dict(eye=dict(x=1.6, y=-1.6, z=0.9)),
+        ),
+    )
+    st.plotly_chart(fig_surface, use_container_width=True)
+    st.caption(f"{grid['expiration'].nunique()} expiration(s), {pivot.shape[1]} strike points. Gaps are missing coverage, not zero IV.")
 
 
 def _strike_ev_table(strike_evs) -> pd.DataFrame:
@@ -1884,39 +2013,71 @@ def render_options_lab(d: dict):
         st.caption("At/past expiration — Greeks aren't defined here.")
 
     st.markdown("##### P&L surface (spot × days forward)")
-    st.caption("Row 0 = right now; the last row = expiration (exact intrinsic value). The white marker is your what-if scenario above.")
+    st.caption("Row/floor 0 = right now; the last row = expiration (exact intrinsic value). The marker is your what-if scenario above.")
+    pl_view = st.radio("View", ["3D surface", "Heatmap"], key="lab_pl_view", horizontal=True)
     spot_range_pct = st.slider("Spot range (± % around current)", min_value=0.05, max_value=0.50, value=0.20, step=0.05, key="lab_heatmap_range")
     grid = options_lab.pl_grid(legs, spot, dte, config.risk_free_rate, config.dividend_yield, spot_range_pct=spot_range_pct)
     pivot = grid.pivot(index="days_forward", columns="spot", values="pl")
     zmax = float(pivot.to_numpy().__abs__().max()) or 1.0
 
-    fig_hm = go.Figure(
-        data=go.Heatmap(
-            z=pivot.values, x=pivot.columns, y=pivot.index,
-            colorscale=[[0, colors.DIVERGING_NEG], [0.5, colors.DIVERGING_MID], [1, colors.DIVERGING_POS]],
-            zmid=0, zmin=-zmax, zmax=zmax,
-            colorbar=dict(title="P&L ($)"),
-            hovertemplate="Spot $%{x:,.2f}<br>Days forward %{y}<br>P&L $%{z:,.0f}<extra></extra>",
+    if pl_view == "3D surface":
+        fig_hm = go.Figure(
+            data=go.Surface(
+                x=pivot.columns, y=pivot.index, z=pivot.values,
+                colorscale=[[0, colors.DIVERGING_NEG], [0.5, colors.DIVERGING_MID], [1, colors.DIVERGING_POS]],
+                cmid=0, cmin=-zmax, cmax=zmax,
+                colorbar=dict(title="P&L ($)"),
+                hovertemplate="Spot $%{x:,.2f}<br>Days forward %{y}<br>P&L $%{z:,.0f}<extra></extra>",
+            )
         )
-    )
-    fig_hm.add_trace(
-        go.Scatter(
-            x=[scenario.spot], y=[scenario.days_forward], mode="markers",
-            marker=dict(symbol="x", size=14, color="white", line=dict(color=colors.INK_PRIMARY, width=2)),
-            name="Scenario", hovertemplate="Scenario<br>Spot $%{x:,.2f}<br>Days forward %{y}<extra></extra>",
+        fig_hm.add_trace(
+            go.Scatter3d(
+                x=[scenario.spot], y=[scenario.days_forward], z=[scenario.pl], mode="markers",
+                marker=dict(symbol="diamond", size=6, color="white", line=dict(color=colors.INK_PRIMARY, width=1)),
+                name="Scenario", hovertemplate="Scenario<br>Spot $%{x:,.2f}<br>Days forward %{y}<br>P&L $%{z:,.0f}<extra></extra>",
+            )
         )
-    )
-    if spot:
-        fig_hm.add_vline(x=spot, line=dict(color=colors.INK_MUTED, dash="dash", width=1), annotation_text="Spot now", annotation_position="top")
-    fig_hm.update_layout(
-        height=420,
-        margin=dict(l=10, r=10, t=20, b=10),
-        plot_bgcolor=colors.SURFACE, paper_bgcolor=colors.SURFACE,
-        xaxis=dict(title="Underlying price ($)", color=colors.INK_MUTED),
-        yaxis=dict(title="Days forward from today", color=colors.INK_MUTED),
-        showlegend=False,
-    )
-    st.plotly_chart(fig_hm, use_container_width=True)
+        fig_hm.update_layout(
+            height=560,
+            margin=dict(l=0, r=0, t=20, b=0),
+            paper_bgcolor=colors.SURFACE,
+            showlegend=False,
+            scene=dict(
+                xaxis=dict(title="Underlying price ($)", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+                yaxis=dict(title="Days forward", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+                zaxis=dict(title="P&L ($)", backgroundcolor=colors.SURFACE, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+                camera=dict(eye=dict(x=1.6, y=-1.6, z=0.9)),
+            ),
+        )
+        st.plotly_chart(fig_hm, use_container_width=True)
+    else:
+        fig_hm = go.Figure(
+            data=go.Heatmap(
+                z=pivot.values, x=pivot.columns, y=pivot.index,
+                colorscale=[[0, colors.DIVERGING_NEG], [0.5, colors.DIVERGING_MID], [1, colors.DIVERGING_POS]],
+                zmid=0, zmin=-zmax, zmax=zmax,
+                colorbar=dict(title="P&L ($)"),
+                hovertemplate="Spot $%{x:,.2f}<br>Days forward %{y}<br>P&L $%{z:,.0f}<extra></extra>",
+            )
+        )
+        fig_hm.add_trace(
+            go.Scatter(
+                x=[scenario.spot], y=[scenario.days_forward], mode="markers",
+                marker=dict(symbol="x", size=14, color="white", line=dict(color=colors.INK_PRIMARY, width=2)),
+                name="Scenario", hovertemplate="Scenario<br>Spot $%{x:,.2f}<br>Days forward %{y}<extra></extra>",
+            )
+        )
+        if spot:
+            fig_hm.add_vline(x=spot, line=dict(color=colors.INK_MUTED, dash="dash", width=1), annotation_text="Spot now", annotation_position="top")
+        fig_hm.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=20, b=10),
+            plot_bgcolor=colors.SURFACE, paper_bgcolor=colors.SURFACE,
+            xaxis=dict(title="Underlying price ($)", color=colors.INK_MUTED),
+            yaxis=dict(title="Days forward from today", color=colors.INK_MUTED),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_hm, use_container_width=True)
 
     st.markdown("##### Greeks sensitivity (vs. spot, at current IV & time)")
     curve = options_lab.greeks_curve(legs, spot, T_years, config.risk_free_rate, config.dividend_yield, spot_range_pct=spot_range_pct)

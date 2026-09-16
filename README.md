@@ -31,7 +31,7 @@ A few things this codebase is meant to show, for anyone skimming it:
   Value-at-Risk with full Black-Scholes stress-test repricing
   (`risk_tool/portfolio_risk.py`).
 - **Test discipline** — the entire `risk_tool/` package is pure, dependency-injected,
-  and independently pytest-covered (213 passing cases: `pytest tests/ -v`) —
+  and independently pytest-covered (237 passing cases: `pytest tests/ -v`) —
   it's also usable as a standalone CLI with no Streamlit/Robinhood dependency
   at all (`python3 -m risk_tool.cli --help`).
 - **Production-adjacent app structure** — Robinhood I/O is fully isolated from
@@ -52,13 +52,23 @@ A few things this codebase is meant to show, for anyone skimming it:
   covered call correctly reads as less risky than naked stock), a
   return-correlation heatmap across everything you hold, side-by-side
   parametric (delta-normal) and historical Value-at-Risk with a simulated
-  daily P&L histogram, and a market-wide stress test that fully reprices
-  every option leg via Black-Scholes at a shocked spot/IV (not a linear
-  Greeks approximation) across a range of preset market moves.
+  daily P&L histogram, a market-wide stress test that fully reprices every
+  option leg via Black-Scholes at a shocked spot/IV (not a linear Greeks
+  approximation) across a range of preset market moves, and a 3D stress
+  surface sweeping spot move × IV shock independently across the whole book
+  (same repricing, two axes instead of one).
+- **Sigma Screener** — ranks tickers by how overdue they are for a 2σ/3σ
+  move relative to their own trailing realized vol, using both an empirical
+  recurrence estimate and a fitted Student-t tail model — with an explicit
+  methodology note on why "overdue" alone isn't a forecast.
 - **Vol Skew** — live IV-by-strike and bid/ask-spread-by-strike for any
-  underlying/expiration (with your held contracts marked on both charts),
-  plus a term-structure view: ATM IV across expirations vs. trailing
-  20d/60d realized vol.
+  underlying/expiration (with your held contracts marked on both charts), a
+  term-structure view (ATM IV across expirations vs. trailing 20d/60d
+  realized vol), a full 3D volatility surface (strike × expiration × IV,
+  OTM-stitched and interpolated onto a shared strike grid), open
+  interest × volume and day-over-day OI change by strike, and a 3D open
+  interest surface (strike × date) built from a local snapshot log since
+  Robinhood exposes no OI history endpoint.
 - **Risk Tool** — strike selection by expected value, Kelly-based position
   sizing with a non-overridable hard cap, pre-committed entry/exit levels,
   and a live monitor that runs exit rules against your actual open
@@ -71,10 +81,11 @@ A few things this codebase is meant to show, for anyone skimming it:
 - **Strategy Payoff** — exact max profit/loss/breakeven(s) for any multi-leg
   combination of calls/puts you build by hand, plus a live mark-to-market
   curve.
-- **Options Lab** — P&L surface (spot × time), Greeks sensitivity curves,
-  and an earnings/IV-crush simulator for any structure — build one from
-  scratch, import an open position, or send one over from the Spread
-  Selector or Strategy Payoff tabs.
+- **Options Lab** — a 3D P&L surface (spot × days-forward, toggleable to a
+  2D heatmap) with the live what-if scenario marked on it, Greeks
+  sensitivity curves, and an earnings/IV-crush simulator for any structure —
+  build one from scratch, import an open position, or send one over from the
+  Spread Selector or Strategy Payoff tabs.
 - **Delta Hedge** — sizes a beta-hedge (shares or futures) for a shares or
   options position against any correlated instrument, with beta estimated
   live from price history, plus a movable P&L scenario chart (drag to any
