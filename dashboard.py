@@ -1622,12 +1622,7 @@ def _render_strategy_profile(
         st.caption("Options Lab needs every leg's current IV — not available for this setup (manual entries with IV = 0 are treated as unset).")
 
 
-_SPREAD_STRATEGY_LABELS = {
-    "Bear put spread (bearish, defined risk)": "bear_put_spread",
-    "Bull put spread (bullish/neutral, credit)": "bull_put_spread",
-    "Straddle (long vol, big move either direction)": "straddle",
-    "Strangle (long vol, cheaper than a straddle)": "strangle",
-}
+_SPREAD_STRATEGY_LABELS = {label: key for key, label in spread_selection.STRATEGY_LABELS.items()}
 
 
 def render_spread_selector(d: dict):
@@ -1656,12 +1651,20 @@ def render_spread_selector(d: dict):
             "right or wrong. The top-ranked candidate can end up being the one with the *least* vega at stake "
             "rather than the strongest actual view — sanity-check the strikes against where you'd realistically "
             "expect the move, not just the ranking.\n"
-            "- Search is bounded to strikes within your chosen window of ATM, not the entire chain."
+            "- Search is bounded to strikes within your chosen window of ATM, not the entire chain.\n"
+            "- **Avg leg spread %** in the results table is a liquidity flag, not a pricing input — the average "
+            "(ask-bid)/mid across the structure's legs. A mathematically great candidate on wide-spread strikes "
+            "can cost more to actually enter/exit than its edge is worth; nothing here adjusts for that "
+            "automatically, so treat a high number as a reason to check the live bid/ask before placing it.\n"
+            "- **Compare all strategies** runs every structure above against the SAME already-fetched chain — "
+            "no extra network calls, just more in-process payoff math — and shows each one's single best "
+            "candidate side by side, so you can see which structure actually has the best setup right now "
+            "instead of re-running this search once per strategy by hand."
         )
 
     with st.form("spread_selector_inputs"):
         c1, c2, c3 = st.columns(3)
-        ticker = c1.text_input("Ticker", value=st.session_state.get("skew_symbol_input", "")).strip().upper()
+        ticker = c1.text_input("Ticker", value=st.session_state.get("skew_symbol_input", ""), key="spread_selector_ticker").strip().upper()
         strategy_label = c2.selectbox("Strategy", list(_SPREAD_STRATEGY_LABELS.keys()), key="spread_selector_strategy")
         strike_increment = c3.number_input("Strike increment ($)", min_value=0.5, value=5.0, step=0.5, key="spread_selector_increment")
 
@@ -1671,6 +1674,10 @@ def render_spread_selector(d: dict):
             "Vol estimate for edge check (1yr history)",
             ["None (rank by risk:reward instead)", "Close-to-close (realized)", "GARCH(1,1) forecast", "EGARCH(1,1) forecast (asymmetric)"],
             key="spread_selector_vol_method",
+        )
+        compare_all = st.checkbox(
+            "Also compare all strategies (best candidate from each, side by side)",
+            key="spread_selector_compare_all",
         )
         submitted = st.form_submit_button("Find best strikes", type="primary")
 
@@ -1750,6 +1757,7 @@ def render_spread_selector(d: dict):
             "P(profit)": c.prob_profit,
             "edge EV": c.edge_ev,
             "breakeven(s)": ", ".join(f"${b:.2f}" for b in c.breakevens),
+            "avg leg spread %": c.avg_spread_pct,
             "setup": "Poor (< min R:R)" if c.is_poor_setup else "OK",
         }
         for c in candidates
@@ -1762,6 +1770,7 @@ def render_spread_selector(d: dict):
         "risk:reward": st.column_config.NumberColumn(format="%.2f:1"),
         "P(profit)": st.column_config.NumberColumn(format="percent"),
         "edge EV": st.column_config.NumberColumn(format="$%+.2f", help="Per share. Your-vol fair value minus market cost."),
+        "avg leg spread %": st.column_config.NumberColumn(format="%.1f%%", help="Average (ask-bid)/mid across the structure's legs — a liquidity flag, not part of the edge/ranking math. Higher = more slippage to actually get in/out."),
     }
     if my_vol is None:
         table = table.drop(columns=["edge EV"])
@@ -1787,6 +1796,57 @@ def render_spread_selector(d: dict):
     _render_strategy_profile(
         legs_for_payoff, ticker, key_suffix=f"spread_selector_{ticker}_{expiration}", dte=dte, live_capable=live_capable,
     )
+
+    if compare_all:
+        st.divider()
+        st.markdown("##### Compare all strategies — best candidate from each")
+        st.caption(
+            "Every structure run against this SAME chain (already fetched above, no extra network calls) — "
+            "ranked the same way as the single-strategy table (edge EV if you picked a vol estimate, "
+            "risk:reward otherwise). 'No candidate' means this strike window/chain didn't have a valid setup "
+            "for that structure (e.g. an iron condor needs listed strikes on both sides of spot)."
+        )
+        comparison = spread_selection.compare_strategies(
+            chain, spot, T, config.risk_free_rate, config.dividend_yield,
+            strike_increment, num_each_side=int(num_each_side), config=config, my_vol=my_vol,
+        )
+        comp_rows = []
+        for strat_key, cand in comparison.items():
+            label = spread_selection.STRATEGY_LABELS[strat_key]
+            if cand is None:
+                comp_rows.append({
+                    "strategy": label, "strikes": "—", "net debit/credit": None, "max profit": None,
+                    "max loss": None, "risk:reward": None, "P(profit)": None, "edge EV": None, "avg leg spread %": None,
+                })
+            else:
+                comp_rows.append({
+                    "strategy": label,
+                    "strikes": cand.strike_label(),
+                    "net debit/credit": cand.net_cost,
+                    "max profit": cand.max_profit if cand.max_profit is not None else float("inf"),
+                    "max loss": cand.max_loss if cand.max_loss is not None else float("-inf"),
+                    "risk:reward": cand.risk_reward,
+                    "P(profit)": cand.prob_profit,
+                    "edge EV": cand.edge_ev,
+                    "avg leg spread %": cand.avg_spread_pct,
+                })
+        comp_table = pd.DataFrame(comp_rows)
+        comp_column_config = {
+            "net debit/credit": st.column_config.NumberColumn(format="$%+.2f", help="Per share."),
+            "max profit": st.column_config.NumberColumn(format="$%.2f", help="Per share."),
+            "max loss": st.column_config.NumberColumn(format="$%.2f", help="Per share."),
+            "risk:reward": st.column_config.NumberColumn(format="%.2f:1"),
+            "P(profit)": st.column_config.NumberColumn(format="percent"),
+            "edge EV": st.column_config.NumberColumn(format="$%+.2f", help="Per share."),
+            "avg leg spread %": st.column_config.NumberColumn(format="%.1f%%"),
+        }
+        if my_vol is None:
+            comp_table = comp_table.drop(columns=["edge EV"])
+            comp_column_config.pop("edge EV")
+        rank_col = "edge EV" if my_vol else "risk:reward"
+        if rank_col in comp_table.columns and comp_table[rank_col].notna().any():
+            comp_table = comp_table.sort_values(rank_col, ascending=False, na_position="last").reset_index(drop=True)
+        st.dataframe(comp_table, use_container_width=True, hide_index=True, column_config=comp_column_config)
 
 
 def render_strategy_payoff(d: dict):

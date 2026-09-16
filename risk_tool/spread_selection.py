@@ -94,7 +94,12 @@ def _lookup(chain: pd.DataFrame, strike: float, option_type: str) -> ChainLeg | 
     row = rows.iloc[0]
     if row["iv"] <= 0 or row["mid"] <= 0:
         return None
-    spread_pct = float(row["spread_pct"]) if "spread_pct" in chain.columns and pd.notna(row["spread_pct"]) else None
+    # A negative spread_pct means ask < bid -- a crossed quote. Real chains
+    # occasionally have these on dead/no-interest strikes (and synthetic
+    # demo pricing can produce them at deep OTM strikes where the modeled
+    # premium rounds toward zero); treat it as "no reliable liquidity
+    # reading" rather than display a nonsense negative percentage.
+    spread_pct = float(row["spread_pct"]) if "spread_pct" in chain.columns and pd.notna(row["spread_pct"]) and row["spread_pct"] >= 0 else None
     return ChainLeg(strike=strike, option_type=option_type, iv=float(row["iv"]), mid=float(row["mid"]), spread_pct=spread_pct)
 
 

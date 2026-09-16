@@ -166,6 +166,21 @@ def test_prob_profit_is_none_not_a_crash_when_net_debit_exactly_equals_spread_wi
     assert cand.prob_profit is None  # not a crash, not a silently wrong number
 
 
+def test_avg_spread_pct_ignores_a_crossed_quote():
+    # A crossed quote (ask < bid -> negative spread_pct) is a data
+    # artifact, not a real liquidity reading -- evaluate_candidate should
+    # treat it as missing (None) rather than average in a nonsense negative
+    # percentage that would make a candidate look impossibly liquid.
+    chain = _make_chain()
+    chain = chain.copy()
+    chain.loc[(chain["strike"] == 105.0) & (chain["type"] == "put"), "spread_pct"] = -50.0  # crossed
+    chain.loc[(chain["strike"] == 95.0) & (chain["type"] == "put"), "spread_pct"] = 4.0  # normal
+
+    cand = evaluate_candidate("bear_put_spread", [("long", "put", 105.0), ("short", "put", 95.0)], chain, S, T, r, q)
+    assert cand is not None
+    assert cand.avg_spread_pct == pytest.approx(4.0)  # only the valid leg's reading is averaged
+
+
 def test_min_risk_reward_flags_poor_setup():
     chain = _make_chain()
     strict_config = RiskConfig(min_risk_reward_ratio=100.0)  # nothing will clear this bar
