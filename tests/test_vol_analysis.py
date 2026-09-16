@@ -8,7 +8,7 @@ that wrong silently double- or under-counts risk on any hedged position.
 import pandas as pd
 import pytest
 
-from app.vol_analysis import book_exposures, book_stress_pl, book_underlyings
+from app.vol_analysis import book_exposures, book_stress_pl, book_underlyings, otm_iv_curve, vol_surface_grid
 
 
 def equity_row(symbol, quantity):
@@ -120,3 +120,69 @@ class TestBookStressPl:
         opt = pd.DataFrame([option_row("SPY", "call", "short", 460.0, 15, 3.0, 2.0, 0.15, -90.0)])
         result = book_stress_pl(pd.DataFrame(), opt, {"SPY": 450.0}, shock_pct=-0.05)
         assert result["option_pl"] > 0  # short call, underlying drops -> position gains
+
+
+def _chain_row(strike, option_type, iv):
+    return {"strike": strike, "type": option_type, "iv": iv}
+
+
+class TestOtmIvCurve:
+    def test_stitches_puts_below_spot_and_calls_at_or_above(self):
+        chain = pd.DataFrame(
+            [
+                _chain_row(90, "call", 0.30), _chain_row(95, "call", 0.28), _chain_row(100, "call", 0.25),
+                _chain_row(90, "put", 0.35), _chain_row(95, "put", 0.32), _chain_row(100, "put", 0.26),
+            ]
+        )
+        curve = otm_iv_curve(chain, spot=97.0)
+        # below spot -> puts (90, 95); at/above spot -> calls (100)
+        assert list(curve["strike"]) == [90.0, 95.0, 100.0]
+        assert list(curve["iv"]) == [0.35, 0.32, 0.25]
+
+    def test_drops_unquoted_strikes(self):
+        chain = pd.DataFrame([_chain_row(90, "put", 0.0), _chain_row(95, "put", -1.0), _chain_row(100, "call", 0.25)])
+        curve = otm_iv_curve(chain, spot=97.0)
+        assert list(curve["strike"]) == [100.0]
+
+    def test_empty_chain_or_no_spot(self):
+        assert otm_iv_curve(pd.DataFrame(), 100.0).empty
+        assert otm_iv_curve(pd.DataFrame([_chain_row(100, "call", 0.25)]), 0.0).empty
+
+
+class TestVolSurfaceGrid:
+    def test_fewer_than_two_usable_expirations_returns_empty(self):
+        curve = otm_iv_curve(pd.DataFrame([_chain_row(100, "call", 0.25), _chain_row(90, "put", 0.30)]), 95.0)
+        assert vol_surface_grid({"2026-10-16": (30, curve)}).empty
+        # a curve with < 2 rows also doesn't count as usable
+        single_row_curve = otm_iv_curve(pd.DataFrame([_chain_row(100, "call", 0.25)]), 95.0)
+        assert vol_surface_grid(
+            {"2026-10-16": (30, curve), "2026-11-20": (60, single_row_curve)}
+        ).empty
+
+    def test_two_expirations_produce_non_degenerate_interpolated_grid(self):
+        near = otm_iv_curve(
+            pd.DataFrame([_chain_row(90, "put", 0.35), _chain_row(95, "put", 0.32), _chain_row(100, "call", 0.25)]),
+            97.0,
+        )
+        far = otm_iv_curve(
+            pd.DataFrame([_chain_row(85, "put", 0.36), _chain_row(95, "put", 0.33), _chain_row(105, "call", 0.27)]),
+            97.0,
+        )
+        grid = vol_surface_grid({"near": (30, near), "far": (60, far)}, n_strike_points=15)
+        assert not grid.empty
+        assert grid["expiration"].nunique() == 2
+        assert grid["strike"].nunique() == 15  # same shared grid for both expirations
+        assert grid["iv"].dropna().nunique() > 5  # real interpolated variation, not a flat/degenerate surface
+        # a strike known to be inside BOTH curves' quoted range must interpolate, not be NaN
+        near_row = grid[(grid["expiration"] == "near") & (grid["strike"].between(90, 100))]
+        assert near_row["iv"].notna().any()
+
+    def test_points_outside_an_expirations_own_strike_range_are_nan_not_extrapolated(self):
+        near = otm_iv_curve(pd.DataFrame([_chain_row(95, "put", 0.32), _chain_row(100, "call", 0.25)]), 97.0)
+        far = otm_iv_curve(pd.DataFrame([_chain_row(70, "put", 0.40), _chain_row(130, "call", 0.20)]), 97.0)
+        grid = vol_surface_grid({"near": (30, near), "far": (60, far)}, n_strike_points=20)
+        near_rows = grid[grid["expiration"] == "near"]
+        # far curve spans 70-130, near curve only spans 95-100 -- most of the
+        # shared grid falls outside near's own quoted range
+        assert near_rows["iv"].isna().sum() > 0
+        assert near_rows["iv"].notna().sum() > 0

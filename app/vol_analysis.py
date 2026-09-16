@@ -1,6 +1,7 @@
 """Book-level volatility exposure analysis on top of raw position DataFrames."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from risk_tool.option_strategy import OptionLeg
@@ -76,6 +77,65 @@ def skew_metrics(chain: pd.DataFrame, spot: float) -> dict:
         risk_reversal = float(call_25d["iv"] - put_25d["iv"])
 
     return {"atm_iv": atm_iv, "risk_reversal_25d": risk_reversal}
+
+
+def otm_iv_curve(chain: pd.DataFrame, spot: float) -> pd.DataFrame:
+    """Per-strike IV using the standard OTM-stitched convention: put IV
+    below spot, call IV at/above spot. OTM contracts are more liquid and
+    don't carry the early-exercise / deep-ITM quoting noise that a naive
+    single-side curve would, so this is the usual way to reduce a chain's
+    two curves (calls, puts) to the one "the market's IV at this strike"
+    curve a vol surface needs. Drops unquoted (iv<=0 or missing) strikes
+    rather than fabricating a value. Returns columns strike, iv, sorted
+    and deduped by strike."""
+    if chain.empty or not spot:
+        return pd.DataFrame(columns=["strike", "iv"])
+    calls = chain[(chain["type"] == "call") & (chain["strike"] >= spot)][["strike", "iv"]]
+    puts = chain[(chain["type"] == "put") & (chain["strike"] < spot)][["strike", "iv"]]
+    combined = pd.concat([calls, puts], ignore_index=True).dropna(subset=["iv"])
+    combined = combined[combined["iv"] > 0]
+    return combined.sort_values("strike").drop_duplicates(subset="strike").reset_index(drop=True)
+
+
+def vol_surface_grid(curves: dict, n_strike_points: int = 30) -> pd.DataFrame:
+    """Stitch several expirations' otm_iv_curve() results into one
+    strike x expiration x IV long-form grid for a go.Surface.
+
+    curves: {expiration_label: (dte, otm_iv_curve_df)}, each df needing
+    columns strike/iv with >=2 rows -- entries not meeting that are
+    skipped (a single-strike curve can't be interpolated).
+
+    Every curve is linearly interpolated onto ONE shared strike grid
+    spanning the union of all curves' strikes, so every expiration lines
+    up on the same x-axis (real chains rarely share identical strikes
+    expiration to expiration). Points outside a given expiration's own
+    quoted strike range are left NaN rather than extrapolated -- past the
+    edge of what that expiration actually quoted, plotly draws a gap
+    instead of us guessing a number.
+
+    Returns columns: expiration, dte, strike, iv (iv may be NaN).
+    Empty (0 rows) if fewer than 2 usable expirations are supplied.
+    """
+    usable = {exp: (dte, curve) for exp, (dte, curve) in curves.items() if len(curve) >= 2}
+    if len(usable) < 2:
+        return pd.DataFrame(columns=["expiration", "dte", "strike", "iv"])
+
+    lo = min(curve["strike"].min() for _, curve in usable.values())
+    hi = max(curve["strike"].max() for _, curve in usable.values())
+    if lo >= hi:
+        return pd.DataFrame(columns=["expiration", "dte", "strike", "iv"])
+    strike_grid = np.linspace(lo, hi, n_strike_points)
+
+    rows = []
+    for exp, (dte, curve) in usable.items():
+        curve_strikes = curve["strike"].to_numpy()
+        curve_ivs = curve["iv"].to_numpy()
+        s_lo, s_hi = curve_strikes.min(), curve_strikes.max()
+        interp_iv = np.interp(strike_grid, curve_strikes, curve_ivs, left=np.nan, right=np.nan)
+        interp_iv = np.where((strike_grid < s_lo) | (strike_grid > s_hi), np.nan, interp_iv)
+        for strike, iv in zip(strike_grid, interp_iv):
+            rows.append({"expiration": exp, "dte": dte, "strike": float(strike), "iv": float(iv) if pd.notna(iv) else None})
+    return pd.DataFrame(rows)
 
 
 def cumulative_return(close: pd.Series) -> pd.Series:
