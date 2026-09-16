@@ -149,6 +149,62 @@ def size_hedge(
     )
 
 
+def same_underlying_hedge_shares(net_delta_shares: float) -> float:
+    """Exact share hedge to flip an option position's aggregate delta-
+    equivalent exposure to zero, when hedging with shares of the SAME
+    underlying the options are on. Unlike size_hedge's cross-asset case,
+    there's no beta/price-ratio conversion here — a share of the
+    underlying has a delta of exactly 1 against itself, so the hedge is
+    just the sign-flipped net delta. Kept as a tiny named function (not a
+    bare minus sign in the UI layer) so the "ratio is exactly 1" reasoning
+    is documented once, in the one place it's true."""
+    return -net_delta_shares
+
+
+def beta_across_windows(
+    underlying_returns: pd.Series,
+    hedge_returns: pd.Series,
+    windows: tuple[int, ...] = (30, 60, 90, 180),
+) -> dict[int, BetaEstimate | None]:
+    """Re-run estimate_beta over several different TRAILING windows (in
+    trading days) carved out of the SAME two return series — no new
+    statistics, just calling the existing, tested OLS estimator on
+    different slices of history.
+
+    Why this matters: size_hedge's beta is a single point estimate over
+    whatever one lookback window you happened to pick. That number can
+    look precise while being highly sensitive to the window — a beta of
+    0.6 over the last 30 days and 0.2 over the last 180 days are BOTH
+    "the beta," and a hedge sized on either one alone hides that
+    disagreement. Comparing several windows surfaces it: estimates that
+    cluster together mean the hedge ratio is on reasonably solid ground;
+    estimates that swing widely mean "the beta" is itself a fragile
+    number this quarter, and the hedge should be treated as rough at best
+    (and rebalanced/re-estimated more often) regardless of how many
+    decimal places size_hedge prints.
+
+    A window longer than the available overlapping history maps to None
+    (skipped) rather than silently shrinking to whatever data exists —
+    that way the caller can tell "not enough history for a 180-day
+    estimate" apart from "estimated it, and the answer happens to be
+    small." Windows are trailing-most-recent: the 30-day estimate uses
+    the last 30 overlapping observations, not the first 30.
+    """
+    idx = underlying_returns.dropna().index.intersection(hedge_returns.dropna().index)
+    idx = idx.sort_values()
+    results: dict[int, BetaEstimate | None] = {}
+    for w in windows:
+        if len(idx) < w:
+            results[w] = None
+            continue
+        window_idx = idx[-w:]
+        try:
+            results[w] = estimate_beta(underlying_returns.loc[window_idx], hedge_returns.loc[window_idx])
+        except ValueError:
+            results[w] = None
+    return results
+
+
 def option_intrinsic_pl(
     spot_at_scenario: float,
     strike: float,

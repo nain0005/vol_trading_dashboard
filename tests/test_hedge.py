@@ -5,10 +5,12 @@ import pandas as pd
 import pytest
 
 from risk_tool.hedge import (
+    beta_across_windows,
     estimate_beta,
     hedge_instrument_pl,
     option_intrinsic_pl,
     option_position_exposure_shares,
+    same_underlying_hedge_shares,
     share_position_exposure_shares,
     share_position_pl,
     simple_returns,
@@ -143,3 +145,61 @@ class TestHedgeInstrumentPl:
 
     def test_short_hedge_gains_when_hedge_price_falls(self):
         assert hedge_instrument_pl(hedge_price_at_scenario=120.0, hedge_price_now=130.0, hedge_units=-50) == pytest.approx(500.0)
+
+
+class TestSameUnderlyingHedgeShares:
+    def test_net_long_delta_needs_a_short_hedge(self):
+        # +250 shares-equivalent of delta (e.g. long calls) -> hedge is short 250 shares.
+        assert same_underlying_hedge_shares(250.0) == pytest.approx(-250.0)
+
+    def test_net_short_delta_needs_a_long_hedge(self):
+        assert same_underlying_hedge_shares(-180.0) == pytest.approx(180.0)
+
+    def test_zero_net_delta_needs_no_hedge(self):
+        # Already delta-neutral (e.g. offsetting legs cancel exactly) -- no shares needed.
+        assert same_underlying_hedge_shares(0.0) == pytest.approx(0.0)
+
+
+class TestBetaAcrossWindows:
+    def test_recovers_the_same_known_slope_in_every_window_when_beta_is_constant(self):
+        # If the true relationship is constant, every window (that has
+        # enough data) should recover ~the same beta -- direct check that
+        # this is just estimate_beta called repeatedly, not new math with
+        # its own bugs.
+        rng = np.random.default_rng(1)
+        hedge_ret = pd.Series(rng.normal(0, 0.01, 200))
+        underlying_ret = 0.7 * hedge_ret
+        results = beta_across_windows(underlying_ret, hedge_ret, windows=(30, 60, 90, 180))
+        for w in (30, 60, 90, 180):
+            assert results[w] is not None
+            assert results[w].beta == pytest.approx(0.7, abs=1e-9)
+            assert results[w].n_obs == w
+
+    def test_uses_the_trailing_slice_not_the_leading_one(self):
+        # Two regimes concatenated: first half beta=0.2, second half beta=0.9.
+        # A 50-day trailing window should land near 0.9 (the recent regime),
+        # not 0.2 (the old one) or something in between (a non-trailing bug
+        # would average the two).
+        rng = np.random.default_rng(2)
+        hedge_ret = pd.Series(rng.normal(0, 0.01, 100))
+        underlying_ret = pd.concat([0.2 * hedge_ret.iloc[:50], 0.9 * hedge_ret.iloc[50:]])
+        results = beta_across_windows(underlying_ret, hedge_ret, windows=(50,))
+        assert results[50].beta == pytest.approx(0.9, abs=1e-9)
+
+    def test_window_longer_than_available_history_is_none_not_truncated(self):
+        rng = np.random.default_rng(3)
+        hedge_ret = pd.Series(rng.normal(0, 0.01, 40))
+        underlying_ret = 0.5 * hedge_ret
+        results = beta_across_windows(underlying_ret, hedge_ret, windows=(30, 60))
+        assert results[30] is not None
+        assert results[60] is None  # only 40 obs available, not 60
+
+    def test_zero_variance_window_is_none_not_a_crash(self):
+        # A window that happens to have zero-variance hedge returns (e.g.
+        # a completely flat/no-trading stretch) should degrade to None,
+        # matching estimate_beta's own ValueError guard -- not propagate
+        # the exception out of beta_across_windows.
+        hedge_ret = pd.Series(list(np.random.default_rng(4).normal(0, 0.01, 30)) + [0.0] * 30)  # flat stretch is the trailing 30
+        underlying_ret = pd.Series(np.random.default_rng(5).normal(0, 0.01, 60))
+        results = beta_across_windows(underlying_ret, hedge_ret, windows=(30,))
+        assert results[30] is None
