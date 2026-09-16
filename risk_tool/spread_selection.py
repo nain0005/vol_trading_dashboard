@@ -1,5 +1,6 @@
-"""Auto strike-selection for four defined-structure multi-leg strategies:
-bear put spread, bull put spread, straddle, strangle.
+"""Auto strike-selection for eight defined-structure multi-leg strategies:
+bear put spread, bull put spread, bull call spread, bear call spread,
+straddle, strangle, iron condor, iron butterfly.
 
 Builds directly on two modules that already exist:
   - strike_selection.py's core idea — compare a structure's market price
@@ -26,6 +27,14 @@ averaging two different IVs into one sigma is still an approximation,
 most defensible when the legs' IVs are close (usually true for strikes a
 handful of increments apart).
 
+Two-breakeven structures split into two mirror-image families:
+straddle/strangle (both legs bought — long vol) profit OUTSIDE the two
+breakevens, so P(profit) sums both tails. Iron condor/iron butterfly
+(both spreads sold, wings bought for protection — short vol, defined
+risk) profit BETWEEN the two breakevens, so P(profit) is 1 minus both
+tails. Same two itm_probability calls, opposite combination — see
+_prob_profit.
+
 All dollar figures throughout (net_cost, max_profit, max_loss, edge_ev,
 my_vol_fair_value) are PER SHARE, matching strike_selection.py's
 convention — multiply by contract_multiplier (100) for per-contract
@@ -41,7 +50,30 @@ from risk_tool.config import DEFAULT_CONFIG, RiskConfig
 from risk_tool.option_strategy import OptionLeg, analyze_strategy
 from risk_tool.pricing import black_scholes_price, itm_probability
 
-STRATEGIES = ("bear_put_spread", "bull_put_spread", "straddle", "strangle")
+STRATEGIES = (
+    "bear_put_spread",
+    "bull_put_spread",
+    "bull_call_spread",
+    "bear_call_spread",
+    "straddle",
+    "strangle",
+    "iron_condor",
+    "iron_butterfly",
+)
+
+# Human-readable labels for UI dropdowns / comparison tables — kept here
+# (not in dashboard.py) so the strategy set and its display names can't
+# drift apart.
+STRATEGY_LABELS = {
+    "bear_put_spread": "Bear put spread (bearish, defined risk)",
+    "bull_put_spread": "Bull put spread (bullish/neutral, credit)",
+    "bull_call_spread": "Bull call spread (bullish, defined-risk debit)",
+    "bear_call_spread": "Bear call spread (bearish/neutral, defined-risk credit)",
+    "straddle": "Straddle (long vol, big move either direction)",
+    "strangle": "Strangle (long vol, cheaper than a straddle)",
+    "iron_condor": "Iron condor (short vol, defined risk, 4 legs)",
+    "iron_butterfly": "Iron butterfly (short vol, defined risk, 4 legs, tighter body)",
+}
 
 
 @dataclass
@@ -52,6 +84,7 @@ class ChainLeg:
     option_type: str  # "call" / "put"
     iv: float
     mid: float
+    spread_pct: float | None = None  # (ask-bid)/mid * 100, when the chain has it — liquidity flag, not a pricing input
 
 
 def _lookup(chain: pd.DataFrame, strike: float, option_type: str) -> ChainLeg | None:
@@ -61,7 +94,8 @@ def _lookup(chain: pd.DataFrame, strike: float, option_type: str) -> ChainLeg | 
     row = rows.iloc[0]
     if row["iv"] <= 0 or row["mid"] <= 0:
         return None
-    return ChainLeg(strike=strike, option_type=option_type, iv=float(row["iv"]), mid=float(row["mid"]))
+    spread_pct = float(row["spread_pct"]) if "spread_pct" in chain.columns and pd.notna(row["spread_pct"]) else None
+    return ChainLeg(strike=strike, option_type=option_type, iv=float(row["iv"]), mid=float(row["mid"]), spread_pct=spread_pct)
 
 
 def _to_option_legs(resolved: list[tuple[str, ChainLeg]]) -> list[OptionLeg]:
@@ -85,21 +119,42 @@ def _prob_profit(strategy: str, breakevens: list[float], S: float, T: float, r: 
     IVs that don't enforce a realistic no-arbitrage relationship between
     strikes) isn't a strike Black-Scholes can price against; itm_probability
     requires a strictly positive strike, so guard rather than crash."""
-    if strategy == "bear_put_spread":
+    # Single-breakeven debit/credit verticals: bear put spread and bear call
+    # spread are both bearish/neutral — profit BELOW the one breakeven.
+    # Bull put spread and bull call spread are both bullish/neutral —
+    # profit ABOVE it. Same math regardless of which leg is the call vs.
+    # the put; only the payoff's direction matters.
+    if strategy in ("bear_put_spread", "bear_call_spread"):
         if len(breakevens) < 1 or breakevens[0] <= 0:
             return None
         return itm_probability(S, breakevens[0], T, r, q, blended_iv, "put")
-    if strategy == "bull_put_spread":
+    if strategy in ("bull_put_spread", "bull_call_spread"):
         if len(breakevens) < 1 or breakevens[0] <= 0:
             return None
         return itm_probability(S, breakevens[0], T, r, q, blended_iv, "call")
     if strategy in ("straddle", "strangle"):
+        # Long vol, both legs bought: profit OUTSIDE the two breakevens
+        # (a big enough move either direction), so sum both tails.
         if len(breakevens) < 2:
             return None
         lo, hi = min(breakevens), max(breakevens)
         if lo <= 0 or hi <= 0:
             return None
         return itm_probability(S, lo, T, r, q, blended_iv, "put") + itm_probability(S, hi, T, r, q, blended_iv, "call")
+    if strategy in ("iron_condor", "iron_butterfly"):
+        # Short vol, both spreads sold with wings bought for protection:
+        # profit is the mirror image of straddle/strangle — BETWEEN the
+        # two breakevens (spot stays range-bound), not outside them.
+        # P(lo < S_T < hi) = P(S_T > lo) - P(S_T > hi), and
+        # itm_probability(..., "call") is exactly P(S_T > K) under this
+        # model, so this is one subtraction of the same building block
+        # straddle/strangle add.
+        if len(breakevens) < 2:
+            return None
+        lo, hi = min(breakevens), max(breakevens)
+        if lo <= 0 or hi <= 0:
+            return None
+        return itm_probability(S, lo, T, r, q, blended_iv, "call") - itm_probability(S, hi, T, r, q, blended_iv, "call")
     return None
 
 
@@ -116,6 +171,7 @@ class SpreadCandidate:
     my_vol_fair_value: float | None  # per share, at the vol you supplied
     edge_ev: float | None  # my_vol_fair_value - net_cost; None if no my_vol given
     is_poor_setup: bool
+    avg_spread_pct: float | None  # mean (ask-bid)/mid*100 across legs — liquidity flag, not part of the pricing/edge math
 
     def strike_label(self) -> str:
         return " / ".join(f"{side} ${cl.strike:.2f}{cl.option_type[0].upper()}" for side, cl in self.legs)
@@ -151,6 +207,9 @@ def evaluate_candidate(
     blended_iv = sum(cl.iv for _, cl in resolved) / len(resolved)
     prob_profit = _prob_profit(strategy, profile.breakevens, S, T, r, q, blended_iv)
 
+    spread_pcts = [cl.spread_pct for _, cl in resolved if cl.spread_pct is not None]
+    avg_spread_pct = sum(spread_pcts) / len(spread_pcts) if spread_pcts else None
+
     my_vol_fair_value = None
     edge_ev = None
     if my_vol:
@@ -172,6 +231,7 @@ def evaluate_candidate(
         my_vol_fair_value=my_vol_fair_value,
         edge_ev=edge_ev,
         is_poor_setup=is_poor_setup,
+        avg_spread_pct=avg_spread_pct,
     )
 
 
@@ -209,6 +269,72 @@ def _strangle_specs(strikes: list[float], spot: float) -> list[list[tuple[str, s
     return [[("long", "call", c), ("long", "put", p)] for c in calls for p in puts]
 
 
+def _bull_call_spread_specs(strikes: list[float]) -> list[list[tuple[str, str, float]]]:
+    """Buy the lower call, sell the higher call — bullish, debit, defined
+    risk. Mirror image of _bear_put_spread_specs (calls instead of puts,
+    long the cheaper/lower strike instead of the more expensive one)."""
+    return [
+        [("long", "call", low_k), ("short", "call", high_k)]
+        for low_k in strikes
+        for high_k in strikes
+        if high_k > low_k
+    ]
+
+
+def _bear_call_spread_specs(strikes: list[float]) -> list[list[tuple[str, str, float]]]:
+    """Sell the lower call, buy the higher call — bearish/neutral, credit,
+    defined risk. Mirror image of _bull_put_spread_specs."""
+    return [
+        [("short", "call", low_k), ("long", "call", high_k)]
+        for low_k in strikes
+        for high_k in strikes
+        if high_k > low_k
+    ]
+
+
+def _iron_condor_specs(strikes: list[float], spot: float) -> list[list[tuple[str, str, float]]]:
+    """A bull put spread (both legs OTM, below spot) plus a bear call
+    spread (both legs OTM, above spot), sharing one net-credit ticket.
+    Every combination here keeps put strikes strictly below spot and call
+    strikes strictly above it — the defining "both sides OTM" shape of a
+    real iron condor, not just any 4-leg combination that happens to net
+    a credit. `evaluate_candidate`/`analyze_strategy` still derive
+    max profit/loss/breakevens exactly from the combined 4-leg payoff;
+    nothing about the risk here is assumed or hand-computed."""
+    puts = [k for k in strikes if k < spot]
+    calls = [k for k in strikes if k > spot]
+    return [
+        [("long", "put", put_long), ("short", "put", put_short), ("short", "call", call_short), ("long", "call", call_long)]
+        for put_long in puts
+        for put_short in puts
+        if put_short > put_long
+        for call_short in calls
+        for call_long in calls
+        if call_long > call_short
+    ]
+
+
+def _iron_butterfly_specs(strikes: list[float], spot: float) -> list[list[tuple[str, str, float]]]:
+    """A short straddle at the single strike closest to spot (the "body"),
+    protected by a long call and a long put further out (the "wings").
+    Unlike iron condor, the body is fixed at ATM rather than searched —
+    that's what makes it a butterfly (a single short strike) instead of a
+    condor (a short RANGE): searching every possible body strike would
+    mostly just reproduce iron condor's wider-body candidates under a
+    different name, so this only varies wing width around the one
+    genuinely ATM body."""
+    if not strikes:
+        return []
+    body = min(strikes, key=lambda k: abs(k - spot))
+    lower_wings = [k for k in strikes if k < body]
+    upper_wings = [k for k in strikes if k > body]
+    return [
+        [("long", "put", wing_lo), ("short", "put", body), ("short", "call", body), ("long", "call", wing_hi)]
+        for wing_lo in lower_wings
+        for wing_hi in upper_wings
+    ]
+
+
 def find_best_spreads(
     strategy: str,
     chain: pd.DataFrame,
@@ -238,10 +364,18 @@ def find_best_spreads(
         specs = _bear_put_spread_specs(strikes)
     elif strategy == "bull_put_spread":
         specs = _bull_put_spread_specs(strikes)
+    elif strategy == "bull_call_spread":
+        specs = _bull_call_spread_specs(strikes)
+    elif strategy == "bear_call_spread":
+        specs = _bear_call_spread_specs(strikes)
     elif strategy == "straddle":
         specs = _straddle_specs(strikes)
-    else:
+    elif strategy == "strangle":
         specs = _strangle_specs(strikes, spot)
+    elif strategy == "iron_condor":
+        specs = _iron_condor_specs(strikes, spot)
+    else:
+        specs = _iron_butterfly_specs(strikes, spot)
 
     candidates = [
         c for leg_specs in specs if (c := evaluate_candidate(strategy, leg_specs, chain, spot, T, r, q, config, my_vol)) is not None
@@ -253,3 +387,36 @@ def find_best_spreads(
         candidates.sort(key=lambda c: c.risk_reward if c.risk_reward is not None else (c.prob_profit or 0.0), reverse=True)
 
     return candidates[:top_n]
+
+
+def compare_strategies(
+    chain: pd.DataFrame,
+    spot: float,
+    T: float,
+    r: float,
+    q: float,
+    strike_increment: float,
+    num_each_side: int = 6,
+    config: RiskConfig = DEFAULT_CONFIG,
+    my_vol: float | None = None,
+    strategies: tuple[str, ...] = STRATEGIES,
+) -> dict[str, SpreadCandidate | None]:
+    """Run find_best_spreads for every strategy in `strategies` against the
+    SAME already-fetched chain, and return each one's single best
+    candidate (None if that strategy has no valid candidate in this
+    strike window — e.g. an iron condor needs listed strikes on both
+    sides of spot; a thin/one-sided chain can starve it while straddles
+    still work fine).
+
+    This is "what's the single best options trade available right now,
+    across structures" — the answer a per-strategy tool can't give without
+    the user re-running the search once per strategy by hand.
+
+    No extra network I/O: `chain` is a DataFrame the caller already fetched
+    once (cached upstream in dashboard.py). Evaluating every strategy here
+    costs extra in-process payoff/probability math only — cheap relative to
+    the one chain fetch, not a multiplied API cost."""
+    return {
+        strat: (find_best_spreads(strat, chain, spot, T, r, q, strike_increment, num_each_side=num_each_side, config=config, my_vol=my_vol, top_n=1) or [None])[0]
+        for strat in strategies
+    }
