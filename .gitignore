@@ -1,6 +1,8 @@
 .env
 data/*.pickle
 data/oi_history/
+data/journal_notes.csv
+data/iv_history/
 logs/
 exports/*.csv
 __pycache__/

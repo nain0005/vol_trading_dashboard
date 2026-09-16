@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from app import colors, journal, oi_history, performance, vol_analysis
+from app import colors, iv_history, journal, journal_notes, oi_history, performance, vol_analysis
 from app.auth import ensure_logged_in, is_demo_mode, logout
 from risk_tool import hedge
 from risk_tool import option_strategy
@@ -1059,12 +1059,34 @@ def render_vol_skew(d: dict):
     render_term_structure(symbol, expirations, spot)
 
     st.divider()
+    render_iv_rank(symbol, expiration, metrics["atm_iv"])
+
+    st.divider()
     render_vol_surface(symbol, expirations, spot)
 
 
 @st.cache_data(ttl=3600, show_spinner="Pulling price history...")
 def fetch_price_history(symbol: str):
     return data_fetch.get_equity_historicals(symbol)
+
+
+def trailing_realized_vols(symbol: str) -> tuple[float | None, float | None]:
+    """20d and 60d trailing close-to-close realized vol for symbol, or None
+    for either that doesn't have enough price history yet. Shared by
+    render_term_structure and the IV Rank section below it -- both want the
+    same "how has this actually moved recently" benchmark, computed the
+    same way, from the same (already-cached) price history fetch."""
+    rv_20 = rv_60 = None
+    try:
+        hist = fetch_price_history(symbol)
+        if not hist.empty:
+            if len(hist) >= 21:
+                rv_20 = rv.close_to_close_vol(hist["close"].tail(21))
+            if len(hist) >= 61:
+                rv_60 = rv.close_to_close_vol(hist["close"].tail(61))
+    except Exception:
+        pass
+    return rv_20, rv_60
 
 
 def render_term_structure(symbol: str, expirations: list, spot: float):
@@ -1110,16 +1132,7 @@ def render_term_structure(symbol: str, expirations: list, spot: float):
         st.caption("Click **Load term structure** to pull ATM IV across the selected expirations.")
         return
 
-    rv_20 = rv_60 = None
-    try:
-        hist = fetch_price_history(symbol)
-        if not hist.empty:
-            if len(hist) >= 21:
-                rv_20 = rv.close_to_close_vol(hist["close"].tail(21))
-            if len(hist) >= 61:
-                rv_60 = rv.close_to_close_vol(hist["close"].tail(61))
-    except Exception:
-        pass
+    rv_20, rv_60 = trailing_realized_vols(symbol)
 
     ts = ts.sort_values("dte")
     fig = go.Figure()
@@ -1159,6 +1172,98 @@ def render_term_structure(symbol: str, expirations: list, spot: float):
         c1.metric("Front-month ATM IV − 20d realized", f"{spread:+.1%}", help="Positive = options pricing more movement than has recently occurred (rich). Negative = cheap.")
         slope = ts.iloc[-1]["atm_iv"] - ts.iloc[0]["atm_iv"]
         c2.metric("Term structure slope (back − front)", f"{slope:+.1%}", help="Positive = contango (normal). Negative = backwardation (event risk priced near-term).")
+
+
+def render_iv_rank(symbol: str, expiration: str, current_atm_iv: float | None):
+    """Where today's ATM IV sits relative to two DIFFERENT benchmarks --
+    deliberately shown side by side so they don't get conflated:
+
+    1. IV Rank / IV Percentile: today's IV vs. its OWN logged IV history
+       for this exact (symbol, expiration). This is the standard metric
+       most platforms show, but Robinhood exposes no historical IV --
+       only a live snapshot -- so this app has to build that history
+       itself, one snapshot per day this chain gets viewed (see
+       app/iv_history.py). It starts at "not enough history yet" and
+       only becomes a real number after enough days accumulate. That is
+       the correct, honest state on day one -- not a bug.
+    2. IV vs. trailing realized vol: today's ATM IV vs. how much this
+       underlying has ACTUALLY moved recently (same realized_vol.py
+       machinery, same 20d/60d windows, as the term structure section
+       above). This needs no logging at all -- real price history already
+       exists -- so it's available immediately, including on day one.
+
+    These answer different questions. IV Rank says "is this option's IV
+    high or low FOR THIS UNDERLYING, historically." IV vs. realized says
+    "is this option's IV high or low RELATIVE TO ACTUAL RECENT MOVEMENT."
+    A stock can have IV at its own 52-week low (low IV Rank) while still
+    being priced rich relative to how little it's actually moved lately
+    (positive IV − realized spread), or the reverse. Don't read one as a
+    substitute for the other.
+    """
+    st.markdown("##### IV Rank / IV Percentile vs. IV − realized vol")
+    st.caption(
+        "Two different, complementary signals about the same ATM IV reading — not the same thing measured twice. "
+        "**IV Rank/Percentile** below is IV vs. its own logged history for this exact contract-expiration. "
+        "**IV − realized vol** is IV vs. how much the underlying has actually moved lately (see Term structure "
+        "above for the chart version of this same comparison)."
+    )
+
+    if current_atm_iv is not None:
+        iv_history.log_snapshot(symbol, expiration, current_atm_iv)
+
+    hist = iv_history.load_history(symbol, expiration)
+    rank_info = iv_history.iv_rank_percentile(hist, current_atm_iv)
+    n_obs = rank_info["n_observations"]
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**IV Rank / IV Percentile**")
+        if n_obs < iv_history.MIN_OBSERVATIONS_FOR_RANK:
+            st.info(
+                f"Logging started — {n_obs} day(s) logged so far for {symbol} {expiration}. "
+                f"Needs at least {iv_history.MIN_OBSERVATIONS_FOR_RANK} logged days (come back on other days "
+                "this chain is viewed) before a rank is a trustworthy number rather than a coin flip."
+            )
+            if n_obs >= 1:
+                st.caption(f"So far logged: {rank_info['min_iv']:.1%} to {rank_info['max_iv']:.1%}.")
+        else:
+            rc1, rc2 = st.columns(2)
+            rc1.metric(
+                "IV Rank",
+                f"{rank_info['iv_rank']:.0%}" if rank_info["iv_rank"] is not None else "—",
+                help="(current − logged min) / (logged max − min). 0% = at its logged low, 100% = at its logged "
+                "high. '—' means every logged reading has been identical so far (no range to rank within).",
+            )
+            rc2.metric(
+                "IV Percentile",
+                f"{rank_info['iv_percentile']:.0%}" if rank_info["iv_percentile"] is not None else "—",
+                help="% of logged days this IV was at or below today's reading. Well-defined even when IV Rank isn't.",
+            )
+            st.caption(
+                f"Based on {n_obs} logged days for {symbol} {expiration}, range "
+                f"{rank_info['min_iv']:.1%}–{rank_info['max_iv']:.1%}. This is history for THIS specific "
+                "expiration, and days-to-expiration shrinks as time passes even if nothing else changes -- a "
+                "reading logged weeks ago sat at a different point on the term structure than today's, so this "
+                "isn't a pure like-for-like vol comparison the way a fixed 30-day constant-maturity series would "
+                "be (this app doesn't have enough chain history to build one yet)."
+            )
+
+    with right:
+        st.markdown("**IV vs. trailing realized vol**")
+        rv_20, rv_60 = trailing_realized_vols(symbol)
+        if current_atm_iv is None:
+            st.caption("No ATM IV available for this chain.")
+        elif rv_20 is None and rv_60 is None:
+            st.caption(f"Not enough price history for {symbol} to compute realized vol yet.")
+        else:
+            if rv_20 is not None:
+                st.metric(
+                    "ATM IV − 20d realized", f"{(current_atm_iv - rv_20):+.1%}",
+                    help="Positive = options pricing more movement than has actually occurred over the last 20 "
+                    "trading days (rich vs. recent behavior). Negative = cheap vs. recent behavior.",
+                )
+            if rv_60 is not None:
+                st.metric("ATM IV − 60d realized", f"{(current_atm_iv - rv_60):+.1%}")
 
 
 def render_vol_surface(symbol: str, expirations: list, spot: float):
@@ -2729,10 +2834,69 @@ def render_journal(d: dict):
         st.caption("No filled trades in range to journal yet.")
         return
 
-    st.dataframe(log, use_container_width=True, hide_index=True)
+    if "order_id" not in log.columns:
+        # Should not happen with real data_fetch/demo_data (both always emit
+        # order_id), but a hand-built or future fills source might omit it --
+        # degrade to the plain read-only table rather than crash on the merge.
+        st.caption("This order history has no order_id column, so per-trade notes/tags aren't available here.")
+        st.dataframe(log, use_container_width=True, hide_index=True)
+        csv_bytes = log.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", data=csv_bytes, file_name=f"trade_journal_{pd.Timestamp.now():%Y%m%d}.csv", mime="text/csv", type="primary")
+        return
+
+    log = journal_notes.merge_notes(log)
+
+    st.caption(
+        "Notes and tags are saved locally (per `order_id`), not sent anywhere, and survive across sessions -- "
+        "tags are freeform (type whatever's useful) rather than a fixed list, separated by `;`."
+    )
+
+    st.markdown("##### Add / edit a note")
+    labels = {
+        row["order_id"]: (
+            f"{pd.Timestamp(row['date']):%Y-%m-%d} · {row.get('symbol', '')} · {row.get('side', '')} "
+            f"{row.get('quantity', '')}@{row.get('price', '')} · order {row['order_id']}"
+        )
+        for _, row in log.iterrows()
+    }
+    order_ids = list(labels.keys())
+    selected_id = st.selectbox("Trade", order_ids, format_func=lambda oid: labels[oid], key="journal_note_trade_select")
+    existing = journal_notes.get_note(selected_id)
+    with st.form("journal_note_form"):
+        tags_in = st.text_input(
+            "Tags (semicolon-separated, freeform)", value=existing["tags"],
+            placeholder="e.g. earnings; thesis-break; good-entry", key="journal_note_tags",
+        )
+        notes_in = st.text_area(
+            "Notes — why you took it, what happened, what you'd do differently",
+            value=existing["notes"], key="journal_note_text", height=100,
+        )
+        submitted = st.form_submit_button("Save note", type="primary")
+    if submitted:
+        journal_notes.save_note(selected_id, tags=tags_in, notes=notes_in)
+        st.success("Saved.")
+        st.rerun()
+
+    st.divider()
+    st.markdown("##### Search & filter")
+    vocabulary = journal_notes.all_tags(log)
+    fc1, fc2 = st.columns([1, 2])
+    tag_filter = fc1.selectbox("Filter by tag", ["(all)"] + vocabulary, key="journal_tag_filter")
+    text_filter = fc2.text_input("Search symbol / notes / tags", key="journal_text_filter", placeholder="e.g. AAPL, mistake, earnings")
+
+    filtered = journal_notes.filter_journal(
+        log, tag=None if tag_filter == "(all)" else tag_filter, text=text_filter or None,
+    )
+    if filtered.empty:
+        st.caption("No trades match this filter.")
+    else:
+        st.caption(f"{len(filtered)} of {len(log)} trades shown.")
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
+
+    st.divider()
     csv_bytes = log.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "Download CSV",
+        "Download CSV (all trades, with notes/tags)",
         data=csv_bytes,
         file_name=f"trade_journal_{pd.Timestamp.now():%Y%m%d}.csv",
         mime="text/csv",

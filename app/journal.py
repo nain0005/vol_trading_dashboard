@@ -1,4 +1,9 @@
-"""Trade journal: normalize fill history into an exportable CSV log."""
+"""Trade journal: normalize fill history into an exportable CSV log.
+
+Per-trade notes/tags (the WHY behind a fill, freeform tags to find it
+again later) live in app.journal_notes, keyed by order_id, and get merged
+onto the table this module builds -- see render_journal in dashboard.py
+for the UI that edits them and app.journal_notes for the storage."""
 from __future__ import annotations
 
 from pathlib import Path
