@@ -205,7 +205,14 @@ def evaluate_candidate(
     profile = analyze_strategy(opt_legs)
 
     risk_reward = None
-    if profile.max_profit is not None and profile.max_loss is not None and profile.max_loss < 0:
+    # A near-zero max_loss (credit happens to land almost exactly at the
+    # spread width, common with round-number synthetic/demo premiums) is
+    # floating-point noise around a TRUE risk of ~$0, not a real number to
+    # divide by -- dividing by e.g. -8.88e-16 produces a meaningless
+    # multi-quadrillion "ratio" instead of the "essentially riskless"
+    # reality. Treat anything tighter than a tenth of a cent as undefined,
+    # matching this module's existing None-means-undefined convention.
+    if profile.max_profit is not None and profile.max_loss is not None and profile.max_loss < -1e-4:
         risk_reward = profile.max_profit / abs(profile.max_loss)
     is_poor_setup = bool(risk_reward is not None and risk_reward < config.min_risk_reward_ratio)
 

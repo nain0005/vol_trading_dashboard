@@ -190,6 +190,26 @@ def test_min_risk_reward_flags_poor_setup():
     assert cand.is_poor_setup is True
 
 
+def test_risk_reward_is_none_not_a_giant_float_when_max_loss_is_floating_point_noise():
+    # Found via streamlit.testing.v1.AppTest exercising the live Spread
+    # Selector's "compare all strategies" checkbox against demo-mode AAPL
+    # data: a bull put spread whose credit landed almost exactly at the
+    # spread width produced max_loss ~= -8.88e-16 (floating-point noise
+    # around a true value of $0, not a real risk to divide by), which fed
+    # into max_profit / abs(max_loss) as a multi-quadrillion "risk:reward"
+    # instead of the "essentially riskless" reality. Reproduced directly:
+    # a chain where credit exactly equals width mathematically, so
+    # max_loss lands on the same kind of near-zero float in practice.
+    chain = pd.DataFrame([
+        {"strike": 100.0, "type": "put", "iv": 0.30, "mid": 5.0},
+        {"strike": 95.0, "type": "put", "iv": 0.30, "mid": 1e-8},  # tiny but > 0 -- still "quoted" by _lookup's own rule
+    ])
+    cand = evaluate_candidate("bull_put_spread", [("short", "put", 100.0), ("long", "put", 95.0)], chain, S, T, r, q)
+    assert cand is not None
+    assert abs(cand.max_loss) < 1e-6  # confirms this test actually hits the near-zero case
+    assert cand.risk_reward is None  # not a garbage multi-quadrillion float
+
+
 # --- Call verticals (bull call spread, bear call spread) ---
 
 

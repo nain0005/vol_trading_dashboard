@@ -1,8 +1,10 @@
 """Correctness tests for the pure helpers in app.data_fetch — no robin_stocks
-mocking needed since these don't touch the network."""
+mocking needed since these don't touch the network, except where noted."""
+from unittest.mock import patch
+
 import pytest
 
-from app.data_fetch import option_unrealized_pl
+from app.data_fetch import get_open_orders, option_unrealized_pl
 
 
 def test_long_leg_profits_when_mark_rises_above_entry():
@@ -45,3 +47,56 @@ def test_crwd_bear_put_spread_regression():
 def test_multiplier_scales_linearly():
     assert option_unrealized_pl("long", avg_price=2.0, mark_price=3.0, qty=1, multiplier=100) == pytest.approx(100.0)
     assert option_unrealized_pl("long", avg_price=2.0, mark_price=3.0, qty=1, multiplier=1) == pytest.approx(1.0)
+
+
+class TestGetOpenOrdersSurvivesRobinStocksBugs:
+    """Reproduces a real crash seen in production: robin_stocks' own
+    get_all_open_stock_orders does `item['cancel']` on every entry without
+    checking for None first, and Robinhood's API occasionally hands back a
+    list containing a None entry (order data still settling, a purged
+    cancelled order, or similar API noise) -- when it does, robin_stocks
+    raises TypeError: 'NoneType' object is not subscriptable from INSIDE
+    its own list comprehension, before ever returning to us. That crashed
+    the whole dashboard page load. get_open_orders() must degrade to an
+    empty result for the side that failed, not take the page down."""
+
+    def test_typeerror_from_equity_orders_call_is_caught(self):
+        with patch("app.data_fetch.rh.orders.get_all_open_stock_orders", side_effect=TypeError("'NoneType' object is not subscriptable")):
+            with patch("app.data_fetch.rh.orders.get_all_open_option_orders", return_value=[]):
+                result = get_open_orders()
+        assert result.empty
+
+    def test_typeerror_from_option_orders_call_is_caught(self):
+        with patch("app.data_fetch.rh.orders.get_all_open_stock_orders", return_value=[]):
+            with patch("app.data_fetch.rh.orders.get_all_open_option_orders", side_effect=TypeError("'NoneType' object is not subscriptable")):
+                result = get_open_orders()
+        assert result.empty
+
+    def test_none_entries_in_a_successfully_returned_list_are_skipped_not_crashed(self):
+        # A defensive second layer: even if robin_stocks itself doesn't
+        # raise (a different version, or Robinhood fixes their API), a
+        # None slipping through the returned list must not crash our own
+        # iteration either.
+        good_order = {
+            "instrument": "https://api.robinhood.com/instruments/abc/", "side": "buy",
+            "quantity": "10", "price": "150.00", "state": "queued", "created_at": "2026-09-16T00:00:00Z",
+        }
+        with patch("app.data_fetch.rh.orders.get_all_open_stock_orders", return_value=[None, good_order]):
+            with patch("app.data_fetch.rh.orders.get_all_open_option_orders", return_value=[None]):
+                with patch("app.data_fetch.rh.stocks.get_symbol_by_url", return_value="AAPL"):
+                    result = get_open_orders()
+        assert len(result) == 1
+        assert result.iloc[0]["symbol"] == "AAPL"
+
+    def test_normal_data_still_flows_through_unaffected(self):
+        good_equity = {
+            "instrument": "https://api.robinhood.com/instruments/abc/", "side": "buy",
+            "quantity": "10", "price": "150.00", "state": "queued", "created_at": "2026-09-16T00:00:00Z",
+        }
+        good_option = {"chain_symbol": "SPY", "direction": "debit", "quantity": "1", "price": "2.50", "state": "queued", "created_at": "2026-09-16T00:00:00Z"}
+        with patch("app.data_fetch.rh.orders.get_all_open_stock_orders", return_value=[good_equity]):
+            with patch("app.data_fetch.rh.orders.get_all_open_option_orders", return_value=[good_option]):
+                with patch("app.data_fetch.rh.stocks.get_symbol_by_url", return_value="AAPL"):
+                    result = get_open_orders()
+        assert len(result) == 2
+        assert set(result["instrument_type"]) == {"equity", "option"}

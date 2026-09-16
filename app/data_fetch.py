@@ -156,11 +156,28 @@ def get_option_positions() -> pd.DataFrame:
 
 
 def get_open_orders() -> pd.DataFrame:
-    equity_orders = rh.orders.get_all_open_stock_orders() or []
-    option_orders = rh.orders.get_all_open_option_orders() or []
+    # robin_stocks' own get_all_open_stock_orders has a bug: it does
+    # `item['cancel']` on every entry Robinhood returns without checking
+    # for None first, and Robinhood's API occasionally includes a None
+    # entry in this list (order data still settling, a cancelled-and-
+    # purged order, or similar transient API noise) -- when it does,
+    # robin_stocks crashes with "TypeError: 'NoneType' object is not
+    # subscriptable" before ever returning to us. That's unfixable from
+    # our side except by catching it here rather than letting one bad
+    # entry take down the whole dashboard page load.
+    try:
+        equity_orders = rh.orders.get_all_open_stock_orders() or []
+    except TypeError:
+        equity_orders = []
+    try:
+        option_orders = rh.orders.get_all_open_option_orders() or []
+    except TypeError:
+        option_orders = []
 
     rows = []
     for o in equity_orders:
+        if not o:
+            continue
         symbol = rh.stocks.get_symbol_by_url(o.get("instrument")) if o.get("instrument") else None
         rows.append(
             {
@@ -174,6 +191,8 @@ def get_open_orders() -> pd.DataFrame:
             }
         )
     for o in option_orders:
+        if not o:
+            continue
         rows.append(
             {
                 "instrument_type": "option",
