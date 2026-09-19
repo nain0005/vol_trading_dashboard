@@ -8,6 +8,7 @@ import streamlit as st
 from app import colors, iv_history, journal, journal_notes, oi_history, performance, vol_analysis
 from app.auth import ensure_logged_in, is_demo_mode, logout
 from risk_tool import hedge
+from risk_tool import oi_distribution
 from risk_tool import option_strategy
 from risk_tool import options_lab
 from risk_tool import parity_arbitrage
@@ -16,6 +17,7 @@ from risk_tool import realized_vol as rv
 from risk_tool import risk_manager
 from risk_tool import sigma_moves
 from risk_tool import sizing as risk_sizing
+from risk_tool import spread_portfolio
 from risk_tool import spread_selection
 from risk_tool import strike_selection
 from risk_tool.config import DEFAULT_CONFIG, RiskConfig
@@ -975,6 +977,122 @@ def render_vol_skew(d: dict):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig_oi, use_container_width=True)
+
+    st.markdown("##### Open interest shape: normal vs. Student-t fit")
+    st.caption(
+        "Fits a normal AND a Student-t curve to how open interest (calls + puts combined) is spread across "
+        "strikes right now — a snapshot of where existing positions sit, not a forecast of where the stock is "
+        "going, and a different question from the historical-return sigma-move screener elsewhere in this app "
+        "(which fits actual price movement, not today's static positioning). High OI at a strike is NOT "
+        "evidence of 'institutional smart money' — it's equally consistent with retail piling into "
+        "round-number strikes, market-maker delta-hedging flow, or stale positions nobody's closed. This says "
+        "only WHERE open interest sits, never WHO holds it or why."
+    )
+    oi_fit_result = oi_distribution.fit_oi_distribution(chain)
+    if oi_fit_result is None:
+        st.info("Fewer than 3 strikes have any open interest for this expiration — not enough to fit a distribution shape.")
+    else:
+        better = oi_fit_result.better_fit
+        t_df = oi_fit_result.t_fit.params["df"]
+        t_practically_normal = t_df > 100
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric(
+            "Better fit (by AIC)", "Student-t" if better == "t" else "Normal",
+            help=(
+                "Picked by AIC (2k − 2·log-likelihood), which penalizes the t-fit's extra parameter — NOT raw "
+                "fit error. A Student-t nests the normal and can always match or beat a normal's raw fit error "
+                "even on genuinely normal data, so comparing raw error alone would make 't wins' close to a "
+                "foregone conclusion rather than a real finding."
+            ),
+        )
+        c2.metric("Normal fit — mean / std", f"${oi_fit_result.normal_fit.params['mean']:,.2f} / ${oi_fit_result.normal_fit.params['std']:,.2f}")
+        c3.metric(
+            "Student-t fitted df", f"{t_df:,.1f}",
+            help=(
+                "Degrees of freedom — lower means fatter tails than a normal. A large value (roughly 100+) "
+                "means the t-fit converged to something normal-equivalent in practice, regardless of which "
+                "label technically won on AIC."
+            ),
+        )
+
+        if better == "t" and t_practically_normal:
+            st.caption(
+                f"Student-t technically wins on AIC, but its fitted df ({t_df:,.0f}) is large enough that it's "
+                "practically indistinguishable from a normal — don't read this as 'OI has fat tails' here."
+            )
+        elif better == "t":
+            st.caption(
+                f"Student-t fits meaningfully better (df={t_df:,.1f}) — today's OI has real weight sitting "
+                "further from the center than a normal curve would predict (e.g. deep OTM hedges or far-dated "
+                "protective positions)."
+            )
+        else:
+            st.caption(
+                "Normal fits at least as well once the extra parameter is penalized — no meaningful evidence "
+                "of fat tails in today's OI shape."
+            )
+
+        combined_oi = chain_activity.groupby("strike", as_index=False)["open_interest"].sum().sort_values("strike")
+        peak_oi = combined_oi["open_interest"].max()
+        fine_x = np.linspace(float(combined_oi["strike"].min()), float(combined_oi["strike"].max()), 300)
+
+        fig_fit = go.Figure()
+        fig_fit.add_trace(
+            go.Bar(
+                x=combined_oi["strike"], y=combined_oi["open_interest"], name="Actual OI (calls+puts)",
+                marker=dict(color=colors.SURFACE_RAISED),
+                hovertemplate="Strike $%{x:.2f}<br>OI %{y:,.0f}<extra></extra>",
+            )
+        )
+        if peak_oi > 0:
+            normal_density = oi_distribution.fitted_density(oi_fit_result.normal_fit, fine_x)
+            if normal_density.max() > 0:
+                fig_fit.add_trace(
+                    go.Scatter(
+                        x=fine_x, y=normal_density / normal_density.max() * peak_oi, mode="lines", name="Normal fit (scaled to peak)",
+                        line=dict(color=colors.CATEGORICAL[0], width=2),
+                        hovertemplate="Strike $%{x:.2f}<extra>Normal fit</extra>",
+                    )
+                )
+            t_density = oi_distribution.fitted_density(oi_fit_result.t_fit, fine_x)
+            if t_density.max() > 0:
+                fig_fit.add_trace(
+                    go.Scatter(
+                        x=fine_x, y=t_density / t_density.max() * peak_oi, mode="lines", name="Student-t fit (scaled to peak)",
+                        line=dict(color=colors.CATEGORICAL[5], width=2),
+                        hovertemplate="Strike $%{x:.2f}<extra>Student-t fit</extra>",
+                    )
+                )
+        if spot:
+            fig_fit.add_vline(x=spot, line=dict(color=colors.INK_MUTED, dash="dash", width=1), annotation_text="Mark", annotation_position="top")
+        fig_fit.update_layout(
+            height=360,
+            margin=dict(l=10, r=10, t=10, b=10),
+            plot_bgcolor=colors.SURFACE,
+            paper_bgcolor=colors.SURFACE,
+            xaxis=dict(title="Strike", showgrid=False, color=colors.INK_MUTED),
+            yaxis=dict(title="Open interest (calls+puts)", showgrid=True, gridcolor=colors.GRIDLINE, color=colors.INK_MUTED),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.caption(
+            "Fitted curves are rescaled to match the bars' peak height for a visual shape comparison only — "
+            "they are probability density curves, not a per-strike OI prediction."
+        )
+        st.plotly_chart(fig_fit, use_container_width=True)
+
+    st.markdown("##### Max pain — a separate, specific number")
+    st.caption(
+        "The strike that minimizes total expiration payout to option holders, computed across every listed "
+        "strike's open interest — a real, well-defined calculation, but NOT the same number as where the fit "
+        "above says OI is concentrated. The two are related (both start from the same OI) but don't usually "
+        "coincide — don't read one as confirming the other."
+    )
+    mp = oi_distribution.max_pain(chain)
+    if mp is None:
+        st.caption("No open interest anywhere in this chain — max pain is undefined.")
+    else:
+        st.metric("Max pain strike", f"${mp:,.2f}")
 
     oi_hist = oi_history.load_history(symbol, expiration)
     n_days_logged = oi_hist["date"].nunique() if not oi_hist.empty else 0
@@ -2149,7 +2267,15 @@ def render_spread_selector(d: dict):
             "- **Compare all strategies** runs every structure above against the SAME already-fetched chain — "
             "no extra network calls, just more in-process payoff math — and shows each one's single best "
             "candidate side by side, so you can see which structure actually has the best setup right now "
-            "instead of re-running this search once per strategy by hand."
+            "instead of re-running this search once per strategy by hand.\n"
+            "- **Strike search method — OI-implied percentiles**: instead of a flat $ window around ATM, this "
+            "places strikes at percentiles of a normal/Student-t curve fit to today's open-interest-by-strike "
+            "shape (same fit shown in the Vol Skew tab), snapped to strikes actually listed. This is a bet that "
+            "current OI positioning is informative about where liquidity will concentrate — it is **not** "
+            "evidence of 'institutional' intent (high OI is equally consistent with retail round-number "
+            "clustering, market-maker hedging flow, or stale positions), and it is **not** the same thing as "
+            "max pain. Needs at least 3 strikes with open interest; falls back to the flat increment search "
+            "otherwise."
         )
 
     with st.form("spread_selector_inputs"):
@@ -2164,6 +2290,21 @@ def render_spread_selector(d: dict):
             "Vol estimate for edge check (1yr history)",
             ["None (rank by risk:reward instead)", "Close-to-close (realized)", "GARCH(1,1) forecast", "EGARCH(1,1) forecast (asymmetric)"],
             key="spread_selector_vol_method",
+        )
+        c6, c7 = st.columns(2)
+        strike_source_label = c6.selectbox(
+            "Strike search method",
+            ["Flat $ increment around ATM (default)", "OI-implied percentiles (normal/t fit to open interest)"],
+            key="spread_selector_strike_source",
+        )
+        oi_percentiles_text = c7.text_input(
+            "OI percentiles to search (%, comma-separated)", value="16, 50, 84",
+            key="spread_selector_oi_percentiles",
+            help=(
+                "Only used when 'OI-implied percentiles' is selected above. Each value places a strike at that "
+                "percentile of whichever distribution (normal or Student-t, picked by AIC) best fits today's "
+                "open-interest-by-strike shape, snapped to the nearest strike actually listed."
+            ),
         )
         compare_all = st.checkbox(
             "Also compare all strategies (best candidate from each, side by side)",
@@ -2212,6 +2353,36 @@ def render_spread_selector(d: dict):
     T = dte / 365.0
     config = DEFAULT_CONFIG
 
+    strike_source = "oi_percentile" if strike_source_label.startswith("OI-implied") else "increment"
+    oi_fit_for_search = None
+    oi_percentiles = spread_selection.DEFAULT_OI_PERCENTILES
+    if strike_source == "oi_percentile":
+        try:
+            oi_percentiles = tuple(sorted({float(p.strip()) / 100.0 for p in oi_percentiles_text.split(",") if p.strip()}))
+        except ValueError:
+            oi_percentiles = ()
+        if not oi_percentiles or any(not (0.0 < p < 1.0) for p in oi_percentiles):
+            st.error("OI percentiles must be comma-separated numbers strictly between 0 and 100.")
+            return
+        oi_fit_result_for_search = oi_distribution.fit_oi_distribution(chain)
+        if oi_fit_result_for_search is None:
+            st.warning(
+                "Fewer than 3 strikes have open interest for this expiration — can't search by OI percentile. "
+                "Falling back to the flat $ increment search instead."
+            )
+            strike_source = "increment"
+        else:
+            oi_fit_for_search = (
+                oi_fit_result_for_search.t_fit if oi_fit_result_for_search.better_fit == "t" else oi_fit_result_for_search.normal_fit
+            )
+            fit_kind_label = "Student-t" if oi_fit_result_for_search.better_fit == "t" else "Normal"
+            st.caption(
+                f"Strike search: OI-implied percentiles, using the **{fit_kind_label}** fit (picked by AIC) at "
+                f"{', '.join(f'{p:.0%}' for p in oi_percentiles)} — strikes actually listed nearest each of "
+                "those percentiles, not a flat $ window. High OI is not evidence of institutional intent; see "
+                "the methodology note above."
+            )
+
     my_vol = None
     if vol_method != "None (rank by risk:reward instead)":
         try:
@@ -2231,6 +2402,7 @@ def render_spread_selector(d: dict):
     candidates = spread_selection.find_best_spreads(
         strategy, chain, spot, T, config.risk_free_rate, config.dividend_yield,
         strike_increment, num_each_side=int(num_each_side), config=config, my_vol=my_vol,
+        strike_source=strike_source, oi_fit=oi_fit_for_search, oi_percentiles=oi_percentiles,
     )
     if not candidates:
         st.warning("No valid candidates found in this strike window — try a wider search or a different expiration.")
@@ -2299,6 +2471,7 @@ def render_spread_selector(d: dict):
         comparison = spread_selection.compare_strategies(
             chain, spot, T, config.risk_free_rate, config.dividend_yield,
             strike_increment, num_each_side=int(num_each_side), config=config, my_vol=my_vol,
+            strike_source=strike_source, oi_fit=oi_fit_for_search, oi_percentiles=oi_percentiles,
         )
         comp_rows = []
         for strat_key, cand in comparison.items():
@@ -2337,6 +2510,198 @@ def render_spread_selector(d: dict):
         if rank_col in comp_table.columns and comp_table[rank_col].notna().any():
             comp_table = comp_table.sort_values(rank_col, ascending=False, na_position="last").reset_index(drop=True)
         st.dataframe(comp_table, use_container_width=True, hide_index=True, column_config=comp_column_config)
+
+
+def render_portfolio_optimizer(d: dict):
+    st.subheader("Portfolio spread optimizer")
+    st.caption(
+        "Given a capital budget, picks the best COMBINATION of option-spread candidates across the tickers "
+        "you list — not just each ticker's own best trade ranked independently (that's what Spread "
+        "Selector's 'compare all strategies' already does). This is the genuinely combinatorial question: "
+        "spending your whole budget on one ticker's top pick can lose to splitting it across two or three "
+        "smaller positions instead, and only a real combinatorial search can tell which."
+    )
+    with st.expander("Methodology — read before trusting a selection", expanded=False):
+        st.markdown(
+            "- **Exact optimization, not a heuristic.** This solves a 0/1 knapsack (each candidate taken whole "
+            "or not at all, under a shared capital budget) via dynamic programming over a discretized budget — "
+            "not a greedy 'sort by edge/cost and take until the budget runs out' shortcut, which is provably "
+            "not optimal in general. The candidate universe here (a handful of tickers × up to 8 strategies "
+            "each) stays small enough that exact DP is genuinely fast.\n"
+            "- **'Discretized' doesn't mean 'approximate' in the way that sounds.** The budget (and risk cap, "
+            "if set) is divided into buckets as fine as one cent for realistic budgets, coarsening only for "
+            "very large ones — see risk_tool/spread_portfolio.py's docstring. The result's real total cost and "
+            "total risk are guaranteed to never exceed what you asked for; only how close the answer gets to "
+            "the true continuous optimum depends on that resolution.\n"
+            "- **Capital cost is NOT always the net premium.** A debit spread's cost is what you pay. A credit "
+            "spread's cost here is its margin requirement (≈ its max loss) — you receive money opening it, but "
+            "a broker still holds collateral against the worst case. Using the (negative) credit itself as "
+            "'cost' would let the optimizer treat credit spreads as a source of free capital, which isn't how "
+            "margin actually works.\n"
+            "- **Edge EV drives everything** — each candidate's edge comes from repricing it at YOUR vol "
+            "estimate vs. market price (same as Spread Selector). Without a real vol view, there's no edge "
+            "number to optimize, so (unlike Spread Selector) this tool requires picking one.\n"
+            "- **Strike search per ticker uses the flat $-increment window**, same as Spread Selector's "
+            "default — not the OI-percentile mode (kept simple here since this runs across many tickers at "
+            "once).\n"
+            "- Candidates with undefined/unlimited risk are automatically **excluded** whenever a risk cap is "
+            "set (can't check an unbounded number against a cap) — see the excluded list below the results."
+        )
+
+    held_symbols = set()
+    if not d["equity_positions"].empty:
+        held_symbols |= set(d["equity_positions"]["symbol"])
+    if not d["option_positions"].empty:
+        held_symbols |= set(d["option_positions"]["symbol"])
+    default_tickers = ", ".join(sorted(held_symbols)) if held_symbols else ", ".join(data_fetch.get_vol_tickers()[:3])
+
+    with st.form("portfolio_optimizer_inputs"):
+        c1, c2, c3 = st.columns(3)
+        tickers_input = c1.text_input("Tickers (comma-separated)", value=default_tickers, key="portfolio_opt_tickers")
+        target_dte = int(c2.number_input("Target days to expiration", min_value=1, max_value=365, value=30, step=1, key="portfolio_opt_dte"))
+        vol_method = c3.selectbox(
+            "Vol estimate for edge (required)",
+            ["Close-to-close (realized)", "GARCH(1,1) forecast", "EGARCH(1,1) forecast (asymmetric)"],
+            key="portfolio_opt_vol_method",
+        )
+
+        c4, c5, c6 = st.columns(3)
+        strike_increment = c4.number_input("Strike increment ($)", min_value=0.5, value=5.0, step=0.5, key="portfolio_opt_increment")
+        num_each_side = int(c5.slider("Strikes to search, each side of ATM", min_value=2, max_value=15, value=6, key="portfolio_opt_width"))
+        strategies_selected = c6.multiselect(
+            "Strategies to include",
+            list(spread_selection.STRATEGY_LABELS.keys()),
+            default=list(spread_selection.STRATEGY_LABELS.keys()),
+            format_func=lambda k: spread_selection.STRATEGY_LABELS[k],
+            key="portfolio_opt_strategies",
+        )
+
+        c7, c8 = st.columns(2)
+        capital_budget = c7.number_input("Capital budget ($)", min_value=0.0, value=5000.0, step=250.0, key="portfolio_opt_budget")
+        use_risk_cap = c8.checkbox("Also cap total risk (max loss)", key="portfolio_opt_use_risk_cap")
+        max_total_risk = None
+        if use_risk_cap:
+            max_total_risk = st.number_input("Max total risk ($)", min_value=0.0, value=2500.0, step=250.0, key="portfolio_opt_risk_cap")
+
+        submitted = st.form_submit_button("Optimize portfolio", type="primary")
+
+    if not submitted:
+        st.info("Enter tickers and a capital budget above, then click Optimize portfolio.")
+        return
+
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    if not tickers:
+        st.error("Enter at least one ticker.")
+        return
+    if not strategies_selected:
+        st.error("Select at least one strategy.")
+        return
+
+    config = DEFAULT_CONFIG
+    today = pd.Timestamp.now().normalize()
+    target_date = today + pd.Timedelta(days=target_dte)
+
+    all_candidates = []
+    skipped: list[str] = []
+    per_ticker_notes: list[str] = []
+    for ticker in tickers:
+        try:
+            expirations = fetch_expirations(ticker)
+            if not expirations:
+                skipped.append(f"{ticker} (no listed options)")
+                continue
+            expiration = min(expirations, key=lambda e: abs((pd.Timestamp(e) - target_date).days))
+            chain = fetch_chain(ticker, expiration)
+            if chain.empty:
+                skipped.append(f"{ticker} (no quoted contracts for {expiration})")
+                continue
+            spot = data_fetch.get_stock_quote(ticker)["mark"]
+            if not spot:
+                skipped.append(f"{ticker} (no live price)")
+                continue
+
+            dte = max((pd.Timestamp(expiration).date() - date.today()).days, 1)
+            T = dte / 365.0
+            hist = fetch_price_history(ticker)
+            if hist.empty or len(hist) < 21:
+                skipped.append(f"{ticker} (not enough price history for {vol_method})")
+                continue
+            log_returns = np.log(hist["close"] / hist["close"].shift(1)).dropna()
+            if vol_method == "Close-to-close (realized)":
+                my_vol = rv.close_to_close_vol(hist["close"])
+            elif vol_method == "GARCH(1,1) forecast":
+                my_vol = rv.garch_forecast_vol(rv.fit_garch_11(log_returns), horizon_days=dte)
+            else:
+                my_vol = rv.egarch_forecast_vol(rv.fit_egarch_11(log_returns), horizon_days=dte)
+
+            comparison = spread_selection.compare_strategies(
+                chain, spot, T, config.risk_free_rate, config.dividend_yield,
+                strike_increment, num_each_side=num_each_side, config=config, my_vol=my_vol,
+                strategies=tuple(strategies_selected),
+            )
+            ticker_candidates = [c for c in comparison.values() if c is not None]
+            if not ticker_candidates:
+                per_ticker_notes.append(f"{ticker} ({expiration}, {dte}d): no valid candidates in this strike window for the selected strategies.")
+                continue
+            built = spread_portfolio.from_spread_candidates(ticker_candidates, label_prefix=f"{ticker} {expiration}")
+            all_candidates.extend(built)
+            per_ticker_notes.append(f"{ticker} ({expiration}, {dte}d, {vol_method} {my_vol:.1%}): {len(built)} candidate(s) added.")
+        except Exception as exc:
+            skipped.append(f"{ticker} ({exc})")
+
+    if skipped:
+        st.warning("Skipped: " + "; ".join(skipped))
+    if per_ticker_notes:
+        with st.expander(f"Candidate universe — {len(all_candidates)} total across {len(tickers) - len(skipped)} ticker(s)", expanded=False):
+            for note in per_ticker_notes:
+                st.caption(note)
+
+    if not all_candidates:
+        st.warning("No candidates were built from any ticker — nothing to optimize. Try different tickers, a wider strike search, or a different target DTE.")
+        return
+
+    result = spread_portfolio.optimize_portfolio(all_candidates, capital_budget=capital_budget, max_total_risk=max_total_risk)
+
+    st.markdown("##### Optimal selection")
+    if not result.selected:
+        st.warning(
+            "No combination fits this budget/risk cap — the cheapest eligible candidate alone may exceed it. "
+            "See excluded candidates below."
+        )
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Positions selected", str(len(result.selected)))
+        c2.metric("Total cost", f"${result.total_cost:,.2f}", help=f"Of ${capital_budget:,.2f} budget ({result.total_cost / capital_budget:.0%} used)." if capital_budget > 0 else None)
+        c3.metric("Total edge EV", f"${result.total_edge:,.2f}")
+        risk_help = None if result.total_max_loss_is_bounded else "Includes at least one undefined/unlimited-risk candidate — this sum is a partial total, not a real cap (only possible when no risk cap was set)."
+        c4.metric("Total max loss", f"${result.total_max_loss:,.2f}" + ("" if result.total_max_loss_is_bounded else " (partial)"), help=risk_help)
+
+        sel_table = pd.DataFrame(
+            [
+                {"position": c.label, "cost": c.cost, "edge EV": c.edge_ev, "max loss": c.max_loss if c.max_loss is not None else float("-inf")}
+                for c in result.selected
+            ]
+        )
+        st.dataframe(
+            sel_table, use_container_width=True, hide_index=True,
+            column_config={
+                "cost": st.column_config.NumberColumn(format="$%.2f", help="Per contract. Capital required to open — margin requirement for credit spreads, net debit for debit spreads."),
+                "edge EV": st.column_config.NumberColumn(format="$%+.2f", help="Per contract."),
+                "max loss": st.column_config.NumberColumn(format="$%.2f", help="Per contract. -inf shown for undefined/unlimited risk."),
+            },
+        )
+        st.caption(
+            f"Discretization: capital resolved to ${result.capital_bucket_size:.4f}/bucket"
+            + (f", risk resolved to ${result.risk_bucket_size:.4f}/bucket" if result.risk_bucket_size is not None else "")
+            + " — see methodology above for what this does and doesn't affect."
+        )
+
+    if result.excluded:
+        with st.expander(f"Excluded candidates ({len(result.excluded)}) — considered but ruled out before optimizing", expanded=False):
+            st.dataframe(
+                pd.DataFrame(result.excluded, columns=["position", "reason"]),
+                use_container_width=True, hide_index=True,
+            )
 
 
 def render_strategy_payoff(d: dict):
@@ -3395,8 +3760,8 @@ def main():
     tabs = st.tabs(
         [
             "Overview", "Positions & Greeks", "Vol Exposure", "Portfolio Risk", "Sigma Screener", "Vol Skew",
-            "Risk Tool", "Spread Selector", "Strategy Payoff", "Options Lab", "Delta Hedge", "Orders & History",
-            "Win Rate", "Journal / Export",
+            "Risk Tool", "Spread Selector", "Portfolio Optimizer", "Strategy Payoff", "Options Lab", "Delta Hedge",
+            "Orders & History", "Win Rate", "Journal / Export",
         ]
     )
     with tabs[0]:
@@ -3418,16 +3783,18 @@ def main():
     with tabs[7]:
         render_spread_selector(d)
     with tabs[8]:
-        render_strategy_payoff(d)
+        render_portfolio_optimizer(d)
     with tabs[9]:
-        render_options_lab(d)
+        render_strategy_payoff(d)
     with tabs[10]:
-        render_delta_hedge(d)
+        render_options_lab(d)
     with tabs[11]:
-        render_orders(d)
+        render_delta_hedge(d)
     with tabs[12]:
-        render_win_rate(d)
+        render_orders(d)
     with tabs[13]:
+        render_win_rate(d)
+    with tabs[14]:
         render_journal(d)
 
 

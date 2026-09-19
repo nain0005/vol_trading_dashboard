@@ -128,6 +128,20 @@ def distribution_percentile_strike(fit: DistributionFit, percentile: float) -> f
     return float(stats.t.ppf(percentile, df=fit.params["df"], loc=fit.params["loc"], scale=fit.params["scale"]))
 
 
+def fitted_density(fit: DistributionFit, x: np.ndarray) -> np.ndarray:
+    """Evaluate a fitted distribution's PDF at each point in `x` -- e.g.
+    to overlay the fitted curve on a chart of the real OI-by-strike bars
+    for a visual "does this track the actual shape" check. Returns raw
+    PDF values, NOT scaled to OI counts: the fit is to the SHAPE of OI
+    across strikes (see module docstring), not a per-strike count
+    prediction, so a caller overlaying this on a bar chart of real OI
+    needs to rescale it itself (e.g. to match the bars' peak height) and
+    should present that as a shape comparison, not a literal forecast."""
+    if fit.kind == "normal":
+        return stats.norm.pdf(x, loc=fit.params["mean"], scale=fit.params["std"])
+    return stats.t.pdf(x, df=fit.params["df"], loc=fit.params["loc"], scale=fit.params["scale"])
+
+
 def max_pain(chain: pd.DataFrame) -> float | None:
     """The strike that minimizes TOTAL payout option WRITERS owe at
     expiration, summed across every listed strike's open interest --

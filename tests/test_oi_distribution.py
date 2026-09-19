@@ -12,6 +12,7 @@ import pytest
 from risk_tool.oi_distribution import (
     distribution_percentile_strike,
     fit_oi_distribution,
+    fitted_density,
     max_pain,
 )
 
@@ -66,6 +67,29 @@ def test_percentile_strike_rejects_out_of_range_input():
         distribution_percentile_strike(fit, 1.5)
     with pytest.raises(ValueError):
         distribution_percentile_strike(fit, 0.0)
+
+
+def test_fitted_density_at_normal_mean_matches_hand_computed_peak():
+    strikes = np.arange(90, 111, 1.0)
+    oi = np.round(np.exp(-((strikes - 100.0) ** 2) / (2 * 3.0**2)) * 1000).astype(int)
+    result = fit_oi_distribution(_chain_from_oi(dict(zip(strikes, oi))))
+    assert result is not None
+    fit = result.normal_fit
+    # A normal PDF's peak (at its own mean) is exactly 1/(std*sqrt(2*pi)) --
+    # the textbook formula, computed here independently of scipy's ppf/pdf.
+    expected_peak = 1.0 / (fit.params["std"] * np.sqrt(2 * np.pi))
+    density_at_mean = fitted_density(fit, np.array([fit.params["mean"]]))[0]
+    assert density_at_mean == pytest.approx(expected_peak, rel=1e-6)
+
+
+def test_fitted_density_is_symmetric_around_the_normal_mean():
+    strikes = np.arange(90, 111, 1.0)
+    oi = np.round(np.exp(-((strikes - 100.0) ** 2) / (2 * 3.0**2)) * 1000).astype(int)
+    result = fit_oi_distribution(_chain_from_oi(dict(zip(strikes, oi))))
+    fit = result.normal_fit
+    mean = fit.params["mean"]
+    left, right = fitted_density(fit, np.array([mean - 4.0, mean + 4.0]))
+    assert left == pytest.approx(right, rel=1e-9)
 
 
 def test_max_pain_matches_hand_computed_total_payout():
