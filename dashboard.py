@@ -10,6 +10,7 @@ from app.auth import ensure_logged_in, is_demo_mode, logout
 from risk_tool import hedge
 from risk_tool import option_strategy
 from risk_tool import options_lab
+from risk_tool import parity_arbitrage
 from risk_tool import portfolio_risk
 from risk_tool import realized_vol as rv
 from risk_tool import risk_manager
@@ -608,7 +609,16 @@ def render_sigma_screener(d: dict):
             "current rolling realized vol vs. this ticker's own full-sample average. A ratio well below 1 "
             "means vol has genuinely dropped, and volatility is mean-reverting — that's real evidence, unlike "
             "the raw day-count alone. Read the overdue ratio and vol compression together; the day count by "
-            "itself is not a probability."
+            "itself is not a probability.\n"
+            "- **The 1σ crash-probability columns answer a sharper version of the same question**: given it's "
+            "*already* gone this many days without a 1σ+ move, what fraction of the time, historically, did "
+            "THIS stock go on to have one within the next N days — versus what pure chance (a memoryless coin "
+            "flipped fresh every day at the stock's own overall hit rate) would predict? If the empirical number "
+            "sits clearly above the pure-chance baseline, that's real evidence the drought means something for "
+            "this name; if it's close to or below, the drought has been uninformative. The historical windows "
+            "used to compute the empirical number overlap (they share most of the same days), so treat the "
+            "analog count as \"how much raw evidence,\" not a textbook independent sample size — few analogs "
+            "means a noisy number."
         )
 
     held_symbols = set()
@@ -628,6 +638,12 @@ def render_sigma_screener(d: dict):
         window = int(c3.number_input(
             "Rolling vol window (days)", min_value=5, max_value=60, value=sigma_moves.DEFAULT_ROLLING_WINDOW, step=5,
         ))
+        c4, c5 = st.columns(2)
+        crash_direction = c4.selectbox(
+            "1σ crash-probability direction", ["down", "up", "either"], index=0,
+            format_func=lambda s: {"down": "Down moves (crash)", "up": "Up moves (melt-up)", "either": "Either direction"}[s],
+        )
+        crash_horizon = int(c5.number_input("Crash-probability horizon (trading days)", min_value=1, max_value=60, value=5, step=1))
         submitted = st.form_submit_button("Run screener", type="primary")
 
     if not submitted:
@@ -657,6 +673,9 @@ def render_sigma_screener(d: dict):
         if s2 is None or s3 is None:
             skipped.append(f"{ticker} (not enough history for a {window}-day rolling window)")
             continue
+        crash = sigma_moves.crash_probability_given_quiet_run(
+            close, threshold=1.0, direction=crash_direction, forward_days=crash_horizon, window=window,
+        )
 
         rows.append(
             {
@@ -674,6 +693,10 @@ def render_sigma_screener(d: dict):
                 "3σ overdue ratio": s3.overdue_ratio,
                 "vol compression (recent/full)": s2.current_vol_ratio,
                 "fitted t df (2σ fit)": s2.fitted_t_df,
+                "1σ quiet days now": crash.current_run_length if crash else None,
+                f"1σ baseline prob (next {crash_horizon}d)": crash.baseline_prob_within_horizon if crash else None,
+                f"1σ empirical prob (next {crash_horizon}d)": crash.empirical_conditional_prob_within_horizon if crash else None,
+                "1σ analogs (n)": crash.n_historical_analogs if crash else None,
             }
         )
 
@@ -687,12 +710,17 @@ def render_sigma_screener(d: dict):
     table["watch (overdue + compressed)"] = (table["2σ overdue ratio"].fillna(0) > 1) & (
         table["vol compression (recent/full)"].fillna(1) < 0.85
     )
+    baseline_col = f"1σ baseline prob (next {crash_horizon}d)"
+    empirical_col = f"1σ empirical prob (next {crash_horizon}d)"
+    table["1σ elevated (empirical > baseline)"] = (table[empirical_col] - table[baseline_col]).fillna(0) > 0.10
 
     st.markdown("##### Screener results")
     st.caption(
         "Sorted by 2σ overdue ratio, descending — click a column header to re-sort. \"Watch\" flags rows where "
         "the overdue ratio AND vol compression agree (the combination with an actual evidence-based case "
-        "behind it, per the methodology above), not the day count alone."
+        "behind it, per the methodology above), not the day count alone. \"1σ elevated\" flags rows where the "
+        "empirical conditional crash probability beats the pure-chance baseline by more than 10 points — "
+        "check the analog count before trusting it, a handful of overlapping historical windows is thin evidence."
     )
     st.dataframe(
         table,
@@ -710,6 +738,16 @@ def render_sigma_screener(d: dict):
                 format="%.1f",
                 help="Lower = fatter tails (more prone to big moves than a normal distribution predicts). "
                 "Below ~10 is a common rule of thumb for 'tails matter here.'",
+            ),
+            baseline_col: st.column_config.NumberColumn(
+                format="percent", help="Pure-chance baseline: 1-(1-p)^N using this ticker's overall 1σ hit rate, no memory of the current quiet streak.",
+            ),
+            empirical_col: st.column_config.NumberColumn(
+                format="percent",
+                help="Empirically, of every past time this ticker had gone at least this many quiet days, what fraction saw a 1σ+ move within the next N days.",
+            ),
+            "1σ analogs (n)": st.column_config.NumberColumn(
+                format="%d", help="How many overlapping historical windows the empirical probability is based on — treat under ~20 as noisy.",
             ),
         },
     )
@@ -1062,6 +1100,9 @@ def render_vol_skew(d: dict):
     render_iv_rank(symbol, expiration, metrics["atm_iv"])
 
     st.divider()
+    render_parity_arbitrage(symbol, expiration, chain, spot)
+
+    st.divider()
     render_vol_surface(symbol, expirations, spot)
 
 
@@ -1264,6 +1305,132 @@ def render_iv_rank(symbol: str, expiration: str, current_atm_iv: float | None):
                 )
             if rv_60 is not None:
                 st.metric("ATM IV − 60d realized", f"{(current_atm_iv - rv_60):+.1%}")
+
+
+def render_parity_arbitrage(symbol: str, expiration: str, chain: pd.DataFrame, spot: float):
+    """Put-call parity at the ATM strike: the call's implied vol and the
+    put's implied vol are tied together by a no-arbitrage relationship
+    that holds independent of any pricing model -- if they diverge more
+    than the real bid/ask spread explains, that's a conversion or
+    reversal, priced here off actual executable quotes (not mid). See
+    risk_tool/parity_arbitrage.py's module docstring for the full
+    derivation and, importantly, why this is NOT textbook riskless
+    arbitrage for real (American-style) equity options."""
+    st.markdown("##### ATM put-call parity / IV arbitrage")
+    st.caption(
+        "At the same strike and expiration, call IV and put IV are tied together by put-call parity — a pure "
+        "no-arbitrage relationship, true regardless of which vol model anyone uses. A real divergence prices a "
+        "conversion or reversal; this uses actual bid/ask, not mid, so it's not spread noise."
+    )
+    with st.expander("Methodology — why this isn't textbook riskless arbitrage, read before trusting a positive edge", expanded=False):
+        st.markdown(
+            "- **Robinhood equity options are American-style**; the formula below is a European result. The "
+            "short leg in either trade (the call in a conversion, the put in a reversal) can be exercised "
+            "against you early — the biggest real-world source of erosion, especially around dividend ex-dates "
+            "(early call assignment to capture the dividend).\n"
+            "- **Shorting stock for a reversal has a real borrow cost** (and can be outright unavailable on "
+            "hard-to-borrow names) that isn't modeled here.\n"
+            "- **The dividend yield used has to be the right forecast** for this option's remaining life, not a "
+            "trailing average — a surprise dividend change moves the theoretical relationship directly.\n"
+            "- The **stock leg** isn't priced off a real bid/ask here (only the two option legs are); real "
+            "execution also crosses that spread, plus commissions and the capital cost of holding the position "
+            "to expiration.\n"
+            "This is real pricing arithmetic off real quotes, not mid-price noise — but it's a statement about "
+            "the numbers, not a guarantee that executing it locks in free money."
+        )
+
+    if not spot:
+        st.caption("No live spot price for this underlying — can't compute parity arbitrage.")
+        return
+
+    dte = (pd.Timestamp(expiration).date() - date.today()).days
+    if dte <= 0:
+        st.caption("This expiration has reached (or passed) its last trading day — parity arbitrage isn't meaningful here.")
+        return
+    T = dte / 365.0
+    config = DEFAULT_CONFIG
+
+    calls = chain[chain["type"] == "call"]
+    puts = chain[chain["type"] == "put"]
+    common_strikes = sorted(set(calls["strike"]) & set(puts["strike"]))
+    if not common_strikes:
+        st.caption("No strikes with both a call and a put quoted for this expiration.")
+        return
+
+    atm_strike = min(common_strikes, key=lambda k: abs(k - spot))
+    atm_idx = common_strikes.index(atm_strike)
+    window_strikes = common_strikes[max(0, atm_idx - 3) : atm_idx + 4]
+
+    rows = []
+    for k in window_strikes:
+        call_row = calls[calls["strike"] == k].iloc[0]
+        put_row = puts[puts["strike"] == k].iloc[0]
+        result = parity_arbitrage.analyze_strike(
+            float(call_row["bid"]), float(call_row["ask"]), float(put_row["bid"]), float(put_row["ask"]),
+            spot, k, T, config.risk_free_rate, config.dividend_yield,
+        )
+        if result is None:
+            continue
+        rows.append(
+            {
+                "strike": k,
+                "call iv": result.call_iv,
+                "put iv": result.put_iv,
+                "iv spread (call − put)": result.iv_spread,
+                "conversion edge ($/sh)": result.conversion_edge,
+                "reversal edge ($/sh)": result.reversal_edge,
+                "best direction": result.best_direction or "—",
+                "best edge ($/sh)": result.best_edge,
+            }
+        )
+
+    if not rows:
+        st.caption("None of the nearby strikes had a full two-sided quote on both the call and the put — can't price an executable edge right now.")
+        return
+
+    table = pd.DataFrame(rows)
+    atm_rows = table[table["strike"] == atm_strike]
+    if atm_rows.empty:
+        st.caption(f"ATM strike (${atm_strike:,.2f}) didn't have a full two-sided quote on both sides.")
+    else:
+        atm_row = atm_rows.iloc[0]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("ATM strike", f"${atm_strike:,.2f}")
+        c2.metric(
+            "Call IV − Put IV", f"{atm_row['iv spread (call − put)']:+.2%}" if pd.notna(atm_row["iv spread (call − put)"]) else "—",
+            help="Positive = call priced rich relative to put at this strike (in vol terms). This is the direct 'ATM IV arbitrage' number.",
+        )
+        c3.metric("Best direction", atm_row["best direction"])
+        c4.metric(
+            "Best edge (per contract)", f"${atm_row['best edge ($/sh)'] * 100:,.2f}",
+            help="Per-share edge × 100. Priced off real bid/ask, not mid — read the methodology above before treating this as free money.",
+        )
+        if atm_row["best edge ($/sh)"] > 0.02:
+            st.warning(
+                f"${atm_row['best edge ($/sh)'] * 100:.2f} per contract via a **{atm_row['best direction']}** at the ATM strike. "
+                "Read the methodology above (American exercise, dividends, borrow cost) before treating this as risk-free."
+            )
+        else:
+            st.caption(
+                "No meaningful parity violation at the ATM strike right now — small residual edges here are just what a "
+                "fair, real bid/ask market looks like once you account for the spread itself."
+            )
+
+    st.markdown("###### Nearby strikes")
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "strike": st.column_config.NumberColumn(format="$%.2f"),
+            "call iv": st.column_config.NumberColumn(format="percent"),
+            "put iv": st.column_config.NumberColumn(format="percent"),
+            "iv spread (call − put)": st.column_config.NumberColumn(format="percent"),
+            "conversion edge ($/sh)": st.column_config.NumberColumn(format="$%+.3f"),
+            "reversal edge ($/sh)": st.column_config.NumberColumn(format="$%+.3f"),
+            "best edge ($/sh)": st.column_config.NumberColumn(format="$%.3f"),
+        },
+    )
 
 
 def render_vol_surface(symbol: str, expirations: list, spot: float):

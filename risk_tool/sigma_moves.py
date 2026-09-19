@@ -106,3 +106,147 @@ def analyze_symbol(
         empirical_avg_days_between=empirical_avg, fitted_t_df=float(df_fit), model_avg_days_between=model_avg,
         days_since_last_exceedance=days_since_last, current_vol_ratio=vol_ratio, overdue_ratio=overdue_ratio,
     )
+
+
+@dataclass
+class CrashProbability:
+    direction: str  # "down" (a "crash"), "up", or "either"
+    threshold: float
+    forward_days: int
+    current_run_length: int  # trading days since the last exceedance (0 = today itself was one)
+    n_observations: int
+    baseline_daily_prob: float | None  # unconditional P(exceedance on any given day) = n_exceed / n_obs
+    baseline_prob_within_horizon: float | None  # memoryless 1-(1-p)^forward_days -- the "if this were pure chance" baseline
+    empirical_conditional_prob_within_horizon: float | None  # the actual answer to the user's question -- see docstring
+    n_historical_analogs: int  # how many historical points had a quiet run >= current_run_length -- sample size behind the conditional number
+
+
+def crash_probability_given_quiet_run(
+    close: pd.Series,
+    threshold: float = 1.0,
+    direction: str = "down",
+    forward_days: int = 5,
+    window: int = DEFAULT_ROLLING_WINDOW,
+) -> CrashProbability | None:
+    """Answers the actual question "given it HASN'T moved > threshold-sigma
+    in a while, what's the empirical chance it does within the next
+    `forward_days` -- and is that actually higher than pure chance, or is
+    the drought meaningless?" Two numbers, deliberately shown side by side
+    rather than collapsed into one:
+
+    - baseline_prob_within_horizon: what you'd expect if exceedance days
+      were i.i.d. (a coin with the stock's own overall hit rate, flipped
+      fresh every day, no memory of the drought at all) -- the
+      pure-chance / memoryless null hypothesis.
+    - empirical_conditional_prob_within_horizon: what ACTUALLY happened,
+      historically, specifically after quiet runs at least as long as the
+      one happening right now. Computed by walking every day in the
+      series, finding every point where a quiet streak of at least
+      current_run_length had just been reached, and checking what
+      fraction of THOSE historical analogs saw an exceedance within the
+      next `forward_days` days.
+
+    If the empirical number sits well above the baseline, that's real
+    evidence -- for THIS stock, THIS threshold -- that quiet spells
+    historically preceded a move more often than chance alone would
+    predict (consistent with vol mean-reversion, see the module-level
+    caveat). If it's close to or below baseline, the drought has been
+    genuinely uninformative for this name and the "it's overdue" instinct
+    isn't supported by its own history. Either answer is a real answer;
+    this function doesn't assume which one you'll get.
+
+    Caveats that don't go away just because this is now empirical:
+    - The historical analog windows OVERLAP (day 50 and day 51 both being
+      "10+ quiet days" share 9 of the same days), so n_historical_analogs
+      is not a count of independent observations -- treat it as "how much
+      raw historical evidence," not a textbook sample size. Small values
+      (rule of thumb: under ~20) mean the empirical number is noisy;
+      that's surfaced explicitly rather than hidden.
+    - This is still just pattern-matching this one stock's own past --
+      it's not a causal model and it can't see genuinely new information
+      (an unannounced earnings date, a macro regime change) that has no
+      precedent in the lookback window.
+
+    None if there's no exceedance in the sample at all (a baseline rate
+    of exactly 0 makes "conditional on how long since the last one"
+    undefined) or too little price history to compute sigma at all.
+    """
+    if direction not in ("down", "up", "either"):
+        raise ValueError(f"direction must be 'down', 'up', or 'either', got {direction!r}")
+
+    z = zscores(close, window).dropna()
+    n_obs = len(z)
+    if n_obs < 5:
+        return None
+
+    z_arr = z.to_numpy()
+    if direction == "down":
+        exceed = z_arr <= -threshold
+    elif direction == "up":
+        exceed = z_arr >= threshold
+    else:
+        exceed = np.abs(z_arr) >= threshold
+
+    result = _crash_probability_from_exceedances(exceed, forward_days)
+    if result is None:
+        return None
+    baseline_daily_prob, baseline_within_horizon, current_run, n_analogs, empirical_prob = result
+
+    return CrashProbability(
+        direction=direction, threshold=threshold, forward_days=forward_days, current_run_length=current_run,
+        n_observations=n_obs, baseline_daily_prob=baseline_daily_prob, baseline_prob_within_horizon=baseline_within_horizon,
+        empirical_conditional_prob_within_horizon=empirical_prob, n_historical_analogs=n_analogs,
+    )
+
+
+def _crash_probability_from_exceedances(exceed: np.ndarray, forward_days: int):
+    """Pure boolean-array core of crash_probability_given_quiet_run, split
+    out so the conditional-probability logic can be hand-verified directly
+    against a constructed True/False pattern without needing to reverse-
+    engineer a price series that produces specific z-scores. None if there
+    are no exceedances in the array at all (undefined baseline rate)."""
+    n_obs = len(exceed)
+    n_exceed = int(exceed.sum())
+    if n_exceed == 0:
+        return None
+    baseline_daily_prob = n_exceed / n_obs
+    baseline_within_horizon = 1.0 - (1.0 - baseline_daily_prob) ** forward_days
+
+    # Current run length: consecutive quiet (non-exceedance) days counting
+    # back from the most recent observation. 0 means today itself exceeded.
+    current_run = 0
+    for exceeded_that_day in exceed[::-1]:
+        if exceeded_that_day:
+            break
+        current_run += 1
+
+    # Every historical point i where a quiet run of AT LEAST current_run
+    # days had just been reached (i.e. day i and the current_run-1 days
+    # before it are all quiet) is one analog. Among those, what fraction
+    # saw an exceedance within the next forward_days days?
+    #
+    # current_run == 0 needs its own branch, not just the general window
+    # formula with current_run=0 plugged in: that formula slices
+    # exceed[i+1:i+1] for every i, which is an EMPTY slice regardless of
+    # i -- meaning it passes vacuously (day i doesn't even get checked)
+    # and every single day in history ends up "qualifying," exceedance or
+    # not. current_run == 0 specifically means today WAS an exceedance,
+    # so the matching historical state is "a day where an exceedance ALSO
+    # just happened" -- i.e. exceed[i] is True -- not "any day at all."
+    n_analogs = 0
+    n_hits = 0
+    if current_run == 0:
+        qualifying_days = np.flatnonzero(exceed)
+    else:
+        qualifying_days = [
+            i for i in range(current_run - 1, n_obs)
+            if not exceed[i - current_run + 1 : i + 1].any()
+        ]
+    for i in qualifying_days:
+        n_analogs += 1
+        future = exceed[i + 1 : i + 1 + forward_days]
+        if future.any():
+            n_hits += 1
+
+    empirical_prob = (n_hits / n_analogs) if n_analogs > 0 else None
+    return baseline_daily_prob, baseline_within_horizon, current_run, n_analogs, empirical_prob

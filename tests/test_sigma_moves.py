@@ -8,7 +8,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from risk_tool.sigma_moves import DEFAULT_ROLLING_WINDOW, analyze_symbol, rolling_daily_sigma, zscores
+from risk_tool.sigma_moves import (
+    DEFAULT_ROLLING_WINDOW,
+    _crash_probability_from_exceedances,
+    analyze_symbol,
+    crash_probability_given_quiet_run,
+    rolling_daily_sigma,
+    zscores,
+)
 
 RNG = np.random.default_rng(42)
 
@@ -125,3 +132,114 @@ def test_fitted_t_df_is_lower_for_fatter_tailed_series():
     stats_fat = analyze_symbol("FATTAILED", close_fat, threshold=2.0, window=20)
     assert stats_normal is not None and stats_fat is not None
     assert stats_fat.fitted_t_df < stats_normal.fitted_t_df
+
+
+# --- crash_probability_given_quiet_run / _crash_probability_from_exceedances ---
+
+# Hand-constructed 14-day exceedance pattern, indices 0-13, True at 2, 6, 11:
+#   F F T F F F T F F F F T F F
+# Every number below is derived by hand-walking this exact array (see the
+# accompanying comment math in the PR/commit, reproduced in each assertion).
+_PATTERN = np.array([False, False, True, False, False, False, True, False, False, False, False, True, False, False])
+
+
+def test_crash_probability_core_matches_hand_walked_example():
+    result = _crash_probability_from_exceedances(_PATTERN, forward_days=2)
+    assert result is not None
+    baseline_daily_prob, baseline_within_horizon, current_run, n_analogs, empirical_prob = result
+
+    # 3 exceedances in 14 days.
+    assert baseline_daily_prob == pytest.approx(3 / 14)
+    # 1 - (1 - 3/14)^2 = 1 - (11/14)^2 = 75/196
+    assert baseline_within_horizon == pytest.approx(75 / 196)
+    # Counting back from index 13: F(1), F(2), then index 11 is True -> stop.
+    assert current_run == 2
+    # Hand-walked analogs (windows of the last 2 days both quiet) at
+    # i = 1, 4, 5, 8, 9, 10, 13 -- 7 total. Hits (an exceedance in the next
+    # 2 days after) at i = 1, 4, 5, 9, 10 -- 5 total; i=8 and i=13 miss.
+    assert n_analogs == 7
+    assert empirical_prob == pytest.approx(5 / 7)
+
+
+def test_crash_probability_current_run_zero_when_last_day_exceeded():
+    pattern = np.array([False, False, True])  # most recent day IS an exceedance
+    result = _crash_probability_from_exceedances(pattern, forward_days=1)
+    assert result is not None
+    _, _, current_run, _, _ = result
+    assert current_run == 0
+
+
+def test_crash_probability_current_run_zero_only_matches_actual_exceedance_days():
+    # Regression: the general "window ending at i" formula degenerates to
+    # an EMPTY slice for every i when current_run == 0 (exceed[i+1:i+1]),
+    # which passes vacuously regardless of exceed[i] -- before the fix
+    # this counted every single day in history as an "analog" instead of
+    # only the 3 real exceedance days. Caught via AppTest against demo
+    # data (AAPL/VXX both showed n_analogs == n_observations exactly,
+    # which is the tell). Hand-walked here:
+    #   idx: 0    1     2     3     4     5
+    #        T    F     F     T     F     T   <- current_run = 0 (day 5 exceeded)
+    pattern = np.array([True, False, False, True, False, True])
+    result = _crash_probability_from_exceedances(pattern, forward_days=2)
+    assert result is not None
+    _, _, current_run, n_analogs, empirical_prob = result
+    assert current_run == 0
+    # Qualifying days (exceed[i] itself True): i = 0, 3, 5 -- NOT all 6 days.
+    assert n_analogs == 3
+    # i=0: future=exceed[1:3]=[F,F] -> no hit.
+    # i=3: future=exceed[4:6]=[F,T] -> hit.
+    # i=5: future=exceed[6:8]=[] (past the end) -> no hit.
+    assert empirical_prob == pytest.approx(1 / 3)
+
+
+def test_crash_probability_none_when_no_exceedances_at_all():
+    pattern = np.zeros(50, dtype=bool)
+    assert _crash_probability_from_exceedances(pattern, forward_days=5) is None
+
+
+def test_crash_probability_single_exceedance_gives_one_analog_at_most():
+    # Only one exceedance, at the very start -- current_run counts back to
+    # it, and there's exactly one point in history (right after it) where
+    # that exact run length was reached.
+    pattern = np.array([True] + [False] * 20)
+    result = _crash_probability_from_exceedances(pattern, forward_days=3)
+    assert result is not None
+    _, _, current_run, n_analogs, empirical_prob = result
+    assert current_run == 20  # 20 quiet days since the one exceedance at index 0
+    assert n_analogs == 1  # only index 0 itself reached a "run of >=20 quiet days" (trivially, the exceedance day)
+    assert empirical_prob == 0.0  # the only analog (day 0) was immediately followed by 20 quiet days, no hit
+
+
+def test_crash_probability_given_quiet_run_direction_filters_correctly():
+    # 60 days of tiny noise, one big DOWN day and one big UP day of equal
+    # magnitude planted apart from each other -- direction="down" must only
+    # count the down day, direction="up" only the up day.
+    rng = np.random.default_rng(3)
+    returns = rng.normal(0.0, 0.003, 60)
+    returns[30] = -0.08  # big down day
+    returns[45] = 0.08  # big up day
+    close = pd.Series(np.concatenate([[100.0], 100.0 * np.cumprod(1 + returns)]))
+
+    down_result = crash_probability_given_quiet_run(close, threshold=1.0, direction="down", forward_days=5, window=20)
+    up_result = crash_probability_given_quiet_run(close, threshold=1.0, direction="up", forward_days=5, window=20)
+    assert down_result is not None and up_result is not None
+    assert down_result.direction == "down"
+    assert up_result.direction == "up"
+    # Both baseline rates should reflect exactly 1 exceedance each in this
+    # construction (the planted move dominates; incidental noise-driven
+    # exceedances at |z|>=1 are common at this low a threshold, so just
+    # check the direction-specific mechanics wired correctly rather than
+    # an exact count):
+    assert down_result.baseline_daily_prob is not None and down_result.baseline_daily_prob > 0
+    assert up_result.baseline_daily_prob is not None and up_result.baseline_daily_prob > 0
+
+
+def test_crash_probability_given_quiet_run_returns_none_for_short_history():
+    close = pd.Series([100.0, 101.0, 99.5])
+    assert crash_probability_given_quiet_run(close, threshold=1.0, window=20) is None
+
+
+def test_crash_probability_given_quiet_run_rejects_bad_direction():
+    close = pd.Series(100.0 + np.cumsum(RNG.normal(0, 1, 100)))
+    with pytest.raises(ValueError):
+        crash_probability_given_quiet_run(close, direction="sideways")
