@@ -97,3 +97,61 @@ def size_position(
         recommended_contracts=recommended_contracts,
         capped_by_hard_limit=bool(hard_cap_dollars < kelly_dollars),
     )
+
+
+def size_short_position(
+    account_size: float,
+    premium_received_per_contract: float,
+    mechanical_max_loss_per_contract: float,
+    p_win: float,
+    profit_if_win_per_contract: float,
+    config: RiskConfig = DEFAULT_CONFIG,
+    contract_multiplier: int = 100,
+) -> PositionSizeResult:
+    """Kelly-sizes a short (credit) position — do NOT call size_position()
+    directly for a short trade and pass premium_received where it asks for
+    premium_per_contract; that silently gives the wrong answer, for two
+    separate reasons:
+
+    1. size_position() uses `premium_per_contract` as the denominator of
+       Kelly's b = profit_if_win / premium_per_contract. For a long
+       position, "premium paid" IS the capital at risk, so that's correct.
+       For a short position, premium_received is money credited to you,
+       not money at risk — dividing by it would size the position as if a
+       FATTER credit makes the trade SAFER, which is backwards: a bigger
+       credit on a naked short is usually the market pricing in MORE risk,
+       not less.
+    2. size_position() also uses `premium_per_contract` * contract_multiplier
+       as the dollar "cost" of one contract, to convert a Kelly dollar
+       budget into a contract count. For a short position the number that
+       actually plays that role is the capital you're committing to have
+       at risk under your own exit discipline — see
+       strike_selection.ShortStrikeEV's docstring: that's
+       `mechanical_max_loss`, the loss booked at your own stop-loss rule
+       (config.short_stop_loss_multiple), NOT the option's true
+       theoretical worst case (unbounded for a naked short call, which
+       can't fund a finite Kelly calculation at all — there's no such
+       thing as "how many contracts of unlimited risk can I afford").
+
+    So this function is a thin, explicit remapping: it calls
+    size_position() with `premium_per_contract=mechanical_max_loss_per_contract`,
+    not with premium_received_per_contract. premium_received_per_contract
+    itself never enters the Kelly math — it's accepted here purely so
+    callers can pass everything they know about the trade through one
+    function rather than silently dropping it.
+
+    Sizing a naked short call this way still does NOT bound its true risk.
+    It bounds the risk you're planning to accept if you execute your own
+    stop-loss rule every time, on every contract. A gap through your stop,
+    a halted underlying, or a skipped exit leaves the real exposure open
+    regardless of what this function recommends."""
+    if mechanical_max_loss_per_contract <= 0:
+        raise ValueError(f"mechanical_max_loss_per_contract must be positive, got {mechanical_max_loss_per_contract}")
+    return size_position(
+        account_size=account_size,
+        premium_per_contract=mechanical_max_loss_per_contract,
+        p_win=p_win,
+        profit_if_win_per_contract=profit_if_win_per_contract,
+        config=config,
+        contract_multiplier=contract_multiplier,
+    )

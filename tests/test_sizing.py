@@ -3,7 +3,7 @@ guarantee is the most important property to verify here."""
 import pytest
 
 from risk_tool.config import RiskConfig
-from risk_tool.sizing import half_kelly_fraction, kelly_fraction, size_position
+from risk_tool.sizing import half_kelly_fraction, kelly_fraction, size_position, size_short_position
 
 
 def test_kelly_fraction_known_formula_value():
@@ -97,3 +97,77 @@ class TestSizePosition:
             size_position(account_size=0, premium_per_contract=1.0, p_win=0.5, profit_if_win_per_contract=1.0)
         with pytest.raises(ValueError):
             size_position(account_size=10_000, premium_per_contract=0, p_win=0.5, profit_if_win_per_contract=1.0)
+
+
+class TestSizeShortPosition:
+    def test_uses_mechanical_max_loss_not_premium_received_as_kellys_denominator(self):
+        """The whole point of size_short_position: it must size off
+        mechanical_max_loss_per_contract, NOT premium_received_per_contract.
+        Construct the two so they'd give very different answers if the
+        wrong one were used, and check against a hand-computed Kelly value
+        tied to the CORRECT (mechanical_max_loss) denominator.
+
+        premium_received=5.0 (what you'd collect), mechanical_max_loss=1.0
+        (your stop-loss-rule risk), profit_if_win=1.0 -> b = 1.0 (using the
+        correct denominator). p=0.6, b=1 -> f* = (0.6*1-0.4)/1 = 0.2, same
+        known formula as test_kelly_fraction_known_formula_value above. If
+        premium_received (5.0) were used instead, b would be 0.2 and f*
+        would come out negative (no edge) -- a completely different,
+        wrong, answer.
+        """
+        config = RiskConfig(use_half_kelly=False, max_position_pct_of_account=1.0)
+        result = size_short_position(
+            account_size=100_000,
+            premium_received_per_contract=5.0,
+            mechanical_max_loss_per_contract=1.0,
+            p_win=0.6,
+            profit_if_win_per_contract=1.0,
+            config=config,
+        )
+        assert result.kelly_fraction_raw == pytest.approx(0.2)
+        # Kelly dollars = f* * account_size; contract cost is mechanical_max_loss * 100, not premium_received * 100.
+        assert result.kelly_dollar_size == pytest.approx(0.2 * 100_000)
+
+    def test_matches_size_position_called_directly_with_mechanical_loss_as_premium(self):
+        """size_short_position should be a pure, transparent remapping —
+        identical output to calling size_position with
+        premium_per_contract=mechanical_max_loss_per_contract directly."""
+        config = RiskConfig(use_half_kelly=True, max_position_pct_of_account=0.05)
+        direct = size_position(account_size=50_000, premium_per_contract=2.0, p_win=0.55, profit_if_win_per_contract=3.0, config=config)
+        via_wrapper = size_short_position(
+            account_size=50_000,
+            premium_received_per_contract=9.0,  # deliberately different from mechanical_max_loss -- must be ignored by the Kelly math
+            mechanical_max_loss_per_contract=2.0,
+            p_win=0.55,
+            profit_if_win_per_contract=3.0,
+            config=config,
+        )
+        assert via_wrapper == direct
+
+    def test_rejects_non_positive_mechanical_max_loss(self):
+        with pytest.raises(ValueError):
+            size_short_position(
+                account_size=100_000,
+                premium_received_per_contract=5.0,
+                mechanical_max_loss_per_contract=0.0,
+                p_win=0.6,
+                profit_if_win_per_contract=1.0,
+            )
+
+    def test_naked_short_call_with_unbounded_theoretical_risk_still_sizes_finitely(self):
+        """The scenario this function exists for: a short call's true max
+        loss is unbounded (no finite dollar amount for that), but sizing
+        under the mechanical stop-loss rule must still produce a finite,
+        sane recommendation rather than crashing or returning inf/nan."""
+        import math
+
+        result = size_short_position(
+            account_size=100_000,
+            premium_received_per_contract=3.0,
+            mechanical_max_loss_per_contract=3.0,  # short_stop_loss_multiple=2.0 -> loss = premium*(2-1)
+            p_win=0.75,
+            profit_if_win_per_contract=3.0,
+        )
+        assert math.isfinite(result.recommended_dollar_size)
+        assert math.isfinite(result.kelly_dollar_size)
+        assert result.recommended_contracts >= 0

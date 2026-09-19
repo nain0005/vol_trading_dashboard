@@ -28,6 +28,13 @@ class RiskConfig:
     use_half_kelly: bool = True  # edge estimates are noisy; half-Kelly is the safer default
     max_position_pct_of_account: float = 0.05  # HARD cap — always wins, see sizing.py
 
+    # --- Short (credit) strike selection ---
+    short_stop_loss_multiple: float = 2.0  # buy back a short option once its price grows to this multiple of the
+    # premium you received (e.g. 2.0 = stop out once you'd pay back 2x what you collected). This is the FINITE,
+    # rule-defined loss strike_selection.ShortStrikeEV's EV/Kelly math is built on — see that module's docstring for
+    # why it is explicitly NOT the same thing as a short position's true theoretical max loss (unbounded for a
+    # naked short call). Must be > 1.0.
+
     # --- Exit rules ---
     profit_target_pct: float = 1.00  # close at +100% gain on premium paid
     stop_loss_pct: float = -0.50  # close at -50% loss on premium paid
