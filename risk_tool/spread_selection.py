@@ -39,6 +39,24 @@ All dollar figures throughout (net_cost, max_profit, max_loss, edge_ev,
 my_vol_fair_value) are PER SHARE, matching strike_selection.py's
 convention — multiply by contract_multiplier (100) for per-contract
 dollars, same as that module's callers already do.
+
+Strike search has two alternative sources (find_best_spreads's
+strike_source argument):
+  - "increment" (the default, unchanged from before): a window of
+    consecutive listed strikes at a flat $ increment around ATM. Simple,
+    predictable, no dependency on how OI happens to be shaped today.
+  - "oi_percentile": strikes placed at chosen percentiles of a normal or
+    Student-t curve FIT TO OPEN INTEREST BY STRIKE (oi_distribution.py),
+    snapped to the nearest strike actually listed. Read oi_distribution's
+    module docstring before using this — in short, "OI is concentrated
+    near strike K" is a statement about where EXISTING POSITIONS already
+    sit (retail round-number clustering, market-maker hedging flow, and
+    stale positions all look the same in this number), not a forecast,
+    not "smart money," and not the same thing as max_pain(). Using
+    OI-implied percentiles to place strikes is a bet that current
+    positioning is informative about where liquidity/interest will
+    concentrate at expiration — a real, defensible idea, but a different
+    and weaker claim than "this is where the stock is going."
 """
 from __future__ import annotations
 
@@ -47,6 +65,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from risk_tool.config import DEFAULT_CONFIG, RiskConfig
+from risk_tool.oi_distribution import DistributionFit, distribution_percentile_strike
 from risk_tool.option_strategy import OptionLeg, analyze_strategy
 from risk_tool.pricing import black_scholes_price, itm_probability
 
@@ -253,6 +272,29 @@ def _nearby_strikes(all_strikes: list[float], spot: float, strike_increment: flo
     return sorted(k for k in all_strikes if lo - 1e-6 <= k <= hi + 1e-6)
 
 
+def _nearest_strike(strikes: list[float], target: float) -> float:
+    """The listed strike closest to `target` -- the one nearest-strike
+    "snapping" rule used everywhere this module needs to turn an
+    arbitrary price level into something actually tradable (iron
+    butterfly's ATM body below, and OI-percentile strike search)."""
+    return min(strikes, key=lambda k: abs(k - target))
+
+
+def _oi_percentile_strikes(all_strikes: list[float], fit: DistributionFit, percentiles: tuple[float, ...]) -> list[float]:
+    """Strikes at each of `percentiles` (0-1) of a fitted OI-by-strike
+    distribution (see oi_distribution.py and this module's docstring for
+    what that fit does and doesn't mean), each snapped to the nearest
+    strike ACTUALLY LISTED in the chain via _nearest_strike — you can't
+    trade a strike that doesn't exist. Deduplicated and sorted: adjacent
+    percentiles can snap to the same listed strike (common on a chain
+    with wide $ increments or a tight fit), which legitimately shrinks
+    the search set below len(percentiles) rather than being an error."""
+    if not all_strikes:
+        return []
+    raw = (distribution_percentile_strike(fit, p) for p in percentiles)
+    return sorted({_nearest_strike(all_strikes, r) for r in raw})
+
+
 def _bear_put_spread_specs(strikes: list[float]) -> list[list[tuple[str, str, float]]]:
     return [
         [("long", "put", long_k), ("short", "put", short_k)]
@@ -337,7 +379,7 @@ def _iron_butterfly_specs(strikes: list[float], spot: float) -> list[list[tuple[
     genuinely ATM body."""
     if not strikes:
         return []
-    body = min(strikes, key=lambda k: abs(k - spot))
+    body = _nearest_strike(strikes, spot)
     lower_wings = [k for k in strikes if k < body]
     upper_wings = [k for k in strikes if k > body]
     return [
@@ -345,6 +387,9 @@ def _iron_butterfly_specs(strikes: list[float], spot: float) -> list[list[tuple[
         for wing_lo in lower_wings
         for wing_hi in upper_wings
     ]
+
+
+DEFAULT_OI_PERCENTILES = (0.16, 0.5, 0.84)  # median plus the classic "~1 sigma" wings
 
 
 def find_best_spreads(
@@ -359,18 +404,43 @@ def find_best_spreads(
     config: RiskConfig = DEFAULT_CONFIG,
     my_vol: float | None = None,
     top_n: int = 10,
+    strike_source: str = "increment",
+    oi_fit: DistributionFit | None = None,
+    oi_percentiles: tuple[float, ...] = DEFAULT_OI_PERCENTILES,
 ) -> list[SpreadCandidate]:
     """The one function to call from outside this module. Returns up to
     top_n candidates, ranked by edge EV when my_vol is given (the honest
     edge signal), or by risk:reward otherwise (a market-neutral fallback —
-    with no vol view of your own, there's no edge number to rank by)."""
+    with no vol view of your own, there's no edge number to rank by).
+
+    strike_source picks how the strike search set is built:
+      - "increment" (default, unchanged): _nearby_strikes — a window of
+        strike_increment-spaced strikes around ATM, num_each_side each way.
+      - "oi_percentile": strikes at `oi_percentiles` of `oi_fit` (a
+        DistributionFit from oi_distribution.fit_oi_distribution — the
+        CALLER fits it and decides normal vs. t, since that's a judgment
+        call this module shouldn't make silently), snapped to listed
+        strikes. Raises ValueError if oi_fit is None — there's no fit to
+        search without one; fit_oi_distribution() itself returns None on
+        a chain with too few OI-priced strikes (fewer than 3), so callers
+        need to handle that upstream before reaching here.
+      strike_increment/num_each_side are ignored when strike_source is
+      "oi_percentile" (kept as required positional args so this stays a
+      backwards-compatible addition, not a signature break)."""
     if strategy not in STRATEGIES:
         raise ValueError(f"strategy must be one of {STRATEGIES}, got {strategy!r}")
+    if strike_source not in ("increment", "oi_percentile"):
+        raise ValueError(f"strike_source must be 'increment' or 'oi_percentile', got {strike_source!r}")
     if chain.empty:
         return []
 
     all_strikes = sorted(chain["strike"].unique())
-    strikes = _nearby_strikes(all_strikes, spot, strike_increment, num_each_side)
+    if strike_source == "oi_percentile":
+        if oi_fit is None:
+            raise ValueError("oi_fit is required when strike_source='oi_percentile' — fit one with oi_distribution.fit_oi_distribution(chain) first.")
+        strikes = _oi_percentile_strikes(all_strikes, oi_fit, oi_percentiles)
+    else:
+        strikes = _nearby_strikes(all_strikes, spot, strike_increment, num_each_side)
 
     if strategy == "bear_put_spread":
         specs = _bear_put_spread_specs(strikes)
@@ -412,6 +482,9 @@ def compare_strategies(
     config: RiskConfig = DEFAULT_CONFIG,
     my_vol: float | None = None,
     strategies: tuple[str, ...] = STRATEGIES,
+    strike_source: str = "increment",
+    oi_fit: DistributionFit | None = None,
+    oi_percentiles: tuple[float, ...] = DEFAULT_OI_PERCENTILES,
 ) -> dict[str, SpreadCandidate | None]:
     """Run find_best_spreads for every strategy in `strategies` against the
     SAME already-fetched chain, and return each one's single best
@@ -424,11 +497,19 @@ def compare_strategies(
     across structures" — the answer a per-strategy tool can't give without
     the user re-running the search once per strategy by hand.
 
+    strike_source/oi_fit/oi_percentiles pass straight through to
+    find_best_spreads — see that function's docstring.
+
     No extra network I/O: `chain` is a DataFrame the caller already fetched
     once (cached upstream in dashboard.py). Evaluating every strategy here
     costs extra in-process payoff/probability math only — cheap relative to
     the one chain fetch, not a multiplied API cost."""
     return {
-        strat: (find_best_spreads(strat, chain, spot, T, r, q, strike_increment, num_each_side=num_each_side, config=config, my_vol=my_vol, top_n=1) or [None])[0]
+        strat: (
+            find_best_spreads(
+                strat, chain, spot, T, r, q, strike_increment, num_each_side=num_each_side, config=config, my_vol=my_vol,
+                top_n=1, strike_source=strike_source, oi_fit=oi_fit, oi_percentiles=oi_percentiles,
+            ) or [None]
+        )[0]
         for strat in strategies
     }
