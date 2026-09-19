@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import robin_stocks.robinhood as rh
@@ -309,6 +309,38 @@ def get_stock_quote(symbol: str) -> dict:
     mark = (bid + ask) / 2 if bid and ask else last
 
     return {"symbol": symbol, "bid": bid, "ask": ask, "mark": mark, "last_trade_price": last}
+
+
+def get_earnings_dates(symbol: str) -> list[date]:
+    """Every earnings date Robinhood has on file for `symbol`, past and
+    (when Robinhood has published an estimate) upcoming — sorted, deduped.
+
+    rh.stocks.get_earnings() returns a list of per-quarter dicts shaped like
+    {"report": {"date": "2024-08-01", "timing": "am", "verified": true}, ...};
+    this pulls just the date out of "report", since that's the only field
+    the Risk Tool's earnings-window check needs. Malformed or missing
+    entries are skipped rather than raised — this feeds a warning banner,
+    not something that should take the Risk Tool down if Robinhood's
+    earnings data is incomplete for a given symbol (common for
+    thinly-covered tickers), and a network/API failure returns an empty
+    list for the same reason.
+    """
+    try:
+        raw = rh.stocks.get_earnings(symbol) or []
+    except Exception:
+        return []
+
+    dates: list[date] = []
+    for entry in raw:
+        report = (entry or {}).get("report") or {}
+        date_str = report.get("date")
+        if not date_str:
+            continue
+        try:
+            dates.append(datetime.strptime(date_str, "%Y-%m-%d").date())
+        except (ValueError, TypeError):
+            continue
+    return sorted(set(dates))
 
 
 def get_option_chain_expirations(symbol: str) -> list[str]:

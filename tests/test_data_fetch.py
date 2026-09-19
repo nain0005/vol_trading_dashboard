@@ -1,10 +1,11 @@
 """Correctness tests for the pure helpers in app.data_fetch — no robin_stocks
 mocking needed since these don't touch the network, except where noted."""
+from datetime import date
 from unittest.mock import patch
 
 import pytest
 
-from app.data_fetch import get_open_orders, option_unrealized_pl
+from app.data_fetch import get_earnings_dates, get_open_orders, option_unrealized_pl
 
 
 def test_long_leg_profits_when_mark_rises_above_entry():
@@ -100,3 +101,42 @@ class TestGetOpenOrdersSurvivesRobinStocksBugs:
                     result = get_open_orders()
         assert len(result) == 2
         assert set(result["instrument_type"]) == {"equity", "option"}
+
+
+class TestGetEarningsDates:
+    def test_extracts_and_sorts_report_dates(self):
+        raw = [
+            {"report": {"date": "2025-05-01", "timing": "am"}},
+            {"report": {"date": "2024-08-01", "timing": "pm"}},
+            {"report": {"date": "2025-01-30", "timing": "am"}},
+        ]
+        with patch("app.data_fetch.rh.stocks.get_earnings", return_value=raw):
+            result = get_earnings_dates("AAPL")
+        assert result == [date(2024, 8, 1), date(2025, 1, 30), date(2025, 5, 1)]
+
+    def test_skips_entries_missing_or_malformed_date_instead_of_crashing(self):
+        raw = [
+            {"report": {"date": "2025-05-01"}},
+            {"report": {}},  # no date key at all
+            {"report": None},  # report present but None
+            {},  # no report key at all
+            {"report": {"date": "not-a-date"}},  # malformed
+            None,  # a malformed entry in the list itself
+        ]
+        with patch("app.data_fetch.rh.stocks.get_earnings", return_value=raw):
+            result = get_earnings_dates("AAPL")
+        assert result == [date(2025, 5, 1)]
+
+    def test_dedupes_identical_dates(self):
+        raw = [{"report": {"date": "2025-05-01"}}, {"report": {"date": "2025-05-01"}}]
+        with patch("app.data_fetch.rh.stocks.get_earnings", return_value=raw):
+            result = get_earnings_dates("AAPL")
+        assert result == [date(2025, 5, 1)]
+
+    def test_returns_empty_list_on_none_response_rather_than_crashing(self):
+        with patch("app.data_fetch.rh.stocks.get_earnings", return_value=None):
+            assert get_earnings_dates("AAPL") == []
+
+    def test_returns_empty_list_if_robinhood_call_raises(self):
+        with patch("app.data_fetch.rh.stocks.get_earnings", side_effect=Exception("network error")):
+            assert get_earnings_dates("AAPL") == []

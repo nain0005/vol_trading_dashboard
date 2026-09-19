@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -263,6 +263,27 @@ def get_vol_ticker_quotes() -> pd.DataFrame:
         prev_close = last * float(rng.uniform(0.97, 1.03))
         rows.append({"symbol": t, "last_price": last, "prev_close": prev_close, "change_pct": (last - prev_close) / prev_close * 100})
     return pd.DataFrame(rows)
+
+
+def get_earnings_dates(symbol: str) -> list[date]:
+    """Synthetic earnings calendar — deterministic per symbol (same ticker
+    always shows the same schedule across reruns), mimicking a quarterly
+    cadence: one "next" report 0-119 days out (deliberately spanning a
+    typical Risk Tool DTE window, so demo mode exercises both the "inside
+    the window" and "outside it" branches of the earnings-flag check
+    depending on the symbol/DTE combination, rather than always or never
+    firing) plus three prior quarters (~91 days apart) for shape parity
+    with data_fetch.get_earnings_dates, which returns real past AND
+    upcoming reports when Robinhood has them."""
+    today = datetime.now(timezone.utc).date()
+    offset_days = _seed(symbol, "earnings_next") % 120
+    next_earnings = today + timedelta(days=int(offset_days))
+    dates = [next_earnings]
+    cursor = next_earnings
+    for _ in range(3):
+        cursor = cursor - timedelta(days=91)
+        dates.append(cursor)
+    return sorted(dates)
 
 
 def get_option_chain_expirations(symbol: str) -> list[str]:
