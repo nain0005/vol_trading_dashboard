@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -1371,6 +1371,92 @@ STRIKE_EV_COLUMN_CONFIG = {
 }
 
 
+def _short_strike_ev_table(strike_evs) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "strike": s.strike,
+                "premium received": s.premium_received,
+                "p_win (OTM, risk-neutral)": s.p_win_risk_neutral,
+                "EV": s.ev,
+                "risk:reward (mechanical)": s.risk_reward,
+                "setup": "Poor (< min R:R)" if s.is_poor_setup else "OK",
+                "theoretical max loss": "Unbounded" if s.theoretical_max_loss is None else f"${s.theoretical_max_loss:,.2f}",
+                "delta": s.delta,
+                "theta/day": s.theta,
+                "vega": s.vega,
+            }
+            for s in strike_evs
+        ]
+    )
+
+
+SHORT_STRIKE_EV_COLUMN_CONFIG = {
+    "strike": st.column_config.NumberColumn(format="$%.2f"),
+    "premium received": st.column_config.NumberColumn(format="$%.2f"),
+    "p_win (OTM, risk-neutral)": st.column_config.NumberColumn(format="percent"),
+    "EV": st.column_config.NumberColumn(format="$%+.2f"),
+    "risk-neutral EV": st.column_config.NumberColumn(format="$%+.2f"),
+    "risk:reward (mechanical)": st.column_config.NumberColumn(format="%.2f:1"),
+    "delta": st.column_config.NumberColumn(format="%+.3f"),
+    "theta/day": st.column_config.NumberColumn(format="%+.3f"),
+    "vega": st.column_config.NumberColumn(format="%+.3f"),
+}
+
+
+# Direction dropdown -> (side, option_type). Shared with the strike-EV
+# ranking branch below so the label text and the actual long/short routing
+# can't drift apart.
+_DIRECTION_LABELS = {
+    "Long call (buy, bullish)": ("long", "call"),
+    "Long put (buy, bearish)": ("long", "put"),
+    "Short put (sell, cash-secured — bullish/neutral, credit, loss bounded at $0 underlying)": ("short", "put"),
+    "Short call (sell, naked — bearish/neutral, credit, UNBOUNDED risk)": ("short", "call"),
+}
+
+GOVERNOR_MAX_DELTA_KEY = "governor_max_delta_cap"
+GOVERNOR_MAX_VEGA_KEY = "governor_max_vega_cap"
+
+
+def _portfolio_governor_result(d: dict, config: RiskConfig = DEFAULT_CONFIG):
+    """The same portfolio-governor check render_position_monitor displays,
+    computed from the same inputs (option_positions' delta/vega sums,
+    overview's day_pl/equity) — factored out so render_risk_tool can check
+    the SAME halt state before recommending a brand-new, freshly Kelly-sized
+    trade, instead of a halted account still getting a confident size
+    recommendation from a tool that never looks at the halt.
+
+    Net-delta/vega caps are read from the same session_state keys
+    render_position_monitor's number_input widgets write to
+    (GOVERNOR_MAX_DELTA_KEY / GOVERNOR_MAX_VEGA_KEY). If those widgets
+    haven't rendered yet this session (e.g. render_position_monitor's own
+    early-return for zero open option positions), the keys don't exist and
+    the caps default to unset — matching config.py's own "None = unset"
+    default, which is the correct behavior, not a bug: with zero positions
+    there's nothing to have set a cap against yet. The daily-loss governor
+    is independent of that and is always checked here regardless.
+    """
+    positions = d["option_positions"]
+    net_delta_dollars = float(positions["delta"].sum()) if not positions.empty else 0.0
+    net_vega_dollars = float(positions["vega"].sum()) if not positions.empty else 0.0
+    daily_pnl = float(d["overview"].get("day_pl") or 0.0)
+
+    max_delta_input = st.session_state.get(GOVERNOR_MAX_DELTA_KEY, 0.0) or 0.0
+    max_vega_input = st.session_state.get(GOVERNOR_MAX_VEGA_KEY, 0.0) or 0.0
+    governor_config = RiskConfig(
+        daily_max_loss_pct=config.daily_max_loss_pct,
+        max_net_delta_dollars=max_delta_input if max_delta_input > 0 else None,
+        max_net_vega_dollars=max_vega_input if max_vega_input > 0 else None,
+    )
+    state = risk_manager.PortfolioState(
+        account_size=float(d["overview"].get("equity") or 1.0),
+        daily_pnl=daily_pnl,
+        net_delta_dollars=net_delta_dollars,
+        net_vega_dollars=net_vega_dollars,
+    )
+    return risk_manager.check_portfolio_governors(state, governor_config), state
+
+
 def render_risk_tool(d: dict):
     st.subheader("Options risk management & strike selection")
     st.caption(
@@ -1381,22 +1467,36 @@ def render_risk_tool(d: dict):
 
     account_equity = float(d["overview"].get("equity") or 0.0)
 
+    governor_result, gov_state = _portfolio_governor_result(d)
+    if governor_result.halted:
+        st.error(
+            "**Portfolio governors have halted new entries.** Strike analysis below is still shown for reference, "
+            "but this tool will not recommend a position size while halted — see Position sizing below."
+        )
+        for reason in governor_result.reasons:
+            st.write(f"- {reason}")
+        st.caption(
+            f"Checked against the same governors as the Live Position Monitor below — day P&L {money(gov_state.daily_pnl)}, "
+            f"net delta ${gov_state.net_delta_dollars:,.0f}, net vega ${gov_state.net_vega_dollars:,.2f}."
+        )
+
     with st.form("risk_tool_inputs"):
         c1, c2, c3 = st.columns(3)
-        ticker = c1.text_input("Ticker", value=st.session_state.get("skew_symbol_input", "")).strip().upper()
-        direction = c2.selectbox("Direction", ["call", "put"])
-        dte = c3.number_input("Days to expiry", min_value=1, value=30, step=1)
+        ticker = c1.text_input("Ticker", value=st.session_state.get("skew_symbol_input", ""), key="risk_tool_ticker").strip().upper()
+        direction_label = c2.selectbox("Direction", list(_DIRECTION_LABELS.keys()), key="risk_tool_direction")
+        dte = c3.number_input("Days to expiry", min_value=1, value=30, step=1, key="risk_tool_dte")
 
         c4, c5, c6 = st.columns(3)
-        spot_input = c4.number_input("Spot price ($, 0 = auto-fetch)", min_value=0.0, value=0.0, step=0.5)
-        iv_input = c5.number_input("Market IV (%, 0 = use chain ATM IV)", min_value=0.0, value=0.0, step=1.0)
-        strike_increment = c6.number_input("Strike increment ($)", min_value=0.5, value=5.0, step=0.5)
+        spot_input = c4.number_input("Spot price ($, 0 = auto-fetch)", min_value=0.0, value=0.0, step=0.5, key="risk_tool_spot")
+        iv_input = c5.number_input("Market IV (%, 0 = use chain ATM IV)", min_value=0.0, value=0.0, step=1.0, key="risk_tool_iv")
+        strike_increment = c6.number_input("Strike increment ($)", min_value=0.5, value=5.0, step=0.5, key="risk_tool_strike_increment")
 
         c7, c8 = st.columns(2)
-        account_override = c7.number_input("Account size ($)", min_value=0.0, value=account_equity, step=1000.0)
+        account_override = c7.number_input("Account size ($)", min_value=0.0, value=account_equity, step=1000.0, key="risk_tool_account")
         vol_method = c8.selectbox(
             "Vol estimate for edge check (1yr history)",
             ["None (market IV only)", "Close-to-close (realized)", "GARCH(1,1) forecast", "EGARCH(1,1) forecast (asymmetric — weights recent down-moves more)"],
+            key="risk_tool_vol_method",
         )
 
         submitted = st.form_submit_button("Analyze", type="primary")
@@ -1408,10 +1508,31 @@ def render_risk_tool(d: dict):
         st.error("Enter a ticker.")
         return
 
+    side, direction = _DIRECTION_LABELS[direction_label]
+    is_short = side == "short"
+
     spot = spot_input if spot_input > 0 else data_fetch.get_stock_quote(ticker)["mark"]
     if not spot:
         st.error(f"Couldn't get a live price for {ticker}.")
         return
+
+    try:
+        earnings_dates = data_fetch.get_earnings_dates(ticker)
+    except Exception:
+        earnings_dates = []  # missing earnings data shouldn't block the rest of the tool -- see data_fetch docstring
+    today_date = date.today()
+    window_end = today_date + timedelta(days=int(dte))
+    earnings_in_window = [e for e in earnings_dates if today_date <= e <= window_end]
+    if earnings_in_window:
+        next_earnings = earnings_in_window[0]
+        days_out = (next_earnings - today_date).days
+        st.warning(
+            f"**Earnings for {ticker} on {next_earnings.isoformat()}** falls within this {int(dte)}-day window "
+            f"(day {days_out} of {int(dte)}). Nothing in this tool's EV/probability/sizing model accounts for an "
+            "earnings print — IV crush after the report and overnight gap risk are both real and both absent from "
+            "the Black-Scholes/GARCH machinery here. Consider a DTE that avoids the date, or treat everything below "
+            "as understating the real risk."
+        )
 
     market_iv = iv_input / 100 if iv_input > 0 else None
     if market_iv is None:
@@ -1449,6 +1570,15 @@ def render_risk_tool(d: dict):
     T = dte / 365.0
     strikes = strike_selection.generate_candidate_strikes(spot, strike_increment, config.num_strikes_each_side)
 
+    if is_short and direction == "call":
+        st.warning(
+            "**Naked short call — theoretically UNBOUNDED risk.** The EV, risk:reward, and position sizing below "
+            "are all computed against YOUR OWN mechanical stop-loss rule (buy back once the option's price reaches "
+            f"{config.short_stop_loss_multiple:.1f}x what you received), not against the option's true worst case, "
+            "which has no ceiling — the underlying can keep rising indefinitely. A gap through your stop, a halted "
+            "underlying, or a skipped exit leaves the real exposure open no matter what this tool recommends."
+        )
+
     if realized_or_forecast_vol:
         st.markdown("##### Realized-vs-implied edge check")
         spread = realized_or_forecast_vol - market_iv
@@ -1456,25 +1586,54 @@ def render_risk_tool(d: dict):
         c1.metric("Market IV", f"{market_iv:.1%}")
         c2.metric(vol_method, f"{realized_or_forecast_vol:.1%}")
         c3.metric("Spread (realized − implied)", f"{spread:+.1%}")
-        st.caption(
-            "Positive spread = your realized vol exceeds market IV (options may be cheap relative to actual "
-            "movement); negative = the opposite. This is the only place an actual edge can come from in this "
-            "model — see strike_selection.py's module docstring."
-        )
-
-        comparisons = [
-            strike_selection.compare_implied_vs_realized_ev(
-                spot, K, T, config.risk_free_rate, config.dividend_yield, market_iv, realized_or_forecast_vol, direction, config
+        if is_short:
+            st.caption(
+                "The edge for SELLING premium is the mirror image of the long side: it comes from your vol being "
+                "LOWER than market IV (you think the market is overpricing how much this will actually move), not "
+                "higher. A positive spread here is a reason to be more cautious about this short, not less."
             )
-            for K in strikes
-        ]
-        comparisons.sort(key=lambda c: c.edge_ev.ev, reverse=True)
+        else:
+            st.caption(
+                "Positive spread = your realized vol exceeds market IV (options may be cheap relative to actual "
+                "movement); negative = the opposite. This is the only place an actual edge can come from in this "
+                "model — see strike_selection.py's module docstring."
+            )
 
-        st.markdown("##### Strikes ranked by edge EV (your vol view, market's actual premium)")
-        edge_table = _strike_ev_table([c.edge_ev for c in comparisons])
-        edge_table.insert(edge_table.columns.get_loc("EV") + 1, "risk-neutral EV", [c.risk_neutral_ev.ev for c in comparisons])
-        st.dataframe(edge_table, use_container_width=True, hide_index=True, column_config=STRIKE_EV_COLUMN_CONFIG)
-        best = comparisons[0].edge_ev
+        if is_short:
+            comparisons = [
+                strike_selection.compare_implied_vs_realized_ev_short(
+                    spot, K, T, config.risk_free_rate, config.dividend_yield, market_iv, realized_or_forecast_vol, direction, config
+                )
+                for K in strikes
+            ]
+            comparisons.sort(key=lambda c: c.edge_ev.ev, reverse=True)
+
+            st.markdown("##### Strikes ranked by edge EV (your vol view, market's actual premium)")
+            edge_table = _short_strike_ev_table([c.edge_ev for c in comparisons])
+            edge_table.insert(edge_table.columns.get_loc("EV") + 1, "risk-neutral EV", [c.risk_neutral_ev.ev for c in comparisons])
+            st.dataframe(edge_table, use_container_width=True, hide_index=True, column_config=SHORT_STRIKE_EV_COLUMN_CONFIG)
+            best = comparisons[0].edge_ev
+            best_p_win = best.p_win_risk_neutral
+        else:
+            comparisons = [
+                strike_selection.compare_implied_vs_realized_ev(
+                    spot, K, T, config.risk_free_rate, config.dividend_yield, market_iv, realized_or_forecast_vol, direction, config
+                )
+                for K in strikes
+            ]
+            comparisons.sort(key=lambda c: c.edge_ev.ev, reverse=True)
+
+            st.markdown("##### Strikes ranked by edge EV (your vol view, market's actual premium)")
+            edge_table = _strike_ev_table([c.edge_ev for c in comparisons])
+            edge_table.insert(edge_table.columns.get_loc("EV") + 1, "risk-neutral EV", [c.risk_neutral_ev.ev for c in comparisons])
+            st.dataframe(edge_table, use_container_width=True, hide_index=True, column_config=STRIKE_EV_COLUMN_CONFIG)
+            best = comparisons[0].edge_ev
+            best_p_win = best.p_win_risk_neutral
+    elif is_short:
+        ranked = strike_selection.rank_short_strikes_by_ev(spot, T, config.risk_free_rate, config.dividend_yield, market_iv, direction, strikes, config)
+        st.markdown("##### Strikes ranked by risk-neutral EV (market IV throughout)")
+        st.dataframe(_short_strike_ev_table(ranked), use_container_width=True, hide_index=True, column_config=SHORT_STRIKE_EV_COLUMN_CONFIG)
+        best = ranked[0]
         best_p_win = best.p_win_risk_neutral
     else:
         ranked = strike_selection.rank_strikes_by_ev(spot, T, config.risk_free_rate, config.dividend_yield, market_iv, direction, strikes, config)
@@ -1484,38 +1643,108 @@ def render_risk_tool(d: dict):
         best_p_win = best.p_win_risk_neutral
 
     st.markdown("##### Recommended strike")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Strike", f"${best.strike:.2f}")
-    c2.metric("Premium", f"${best.premium:.2f}")
-    c3.metric("EV", f"${best.ev:+.2f}")
+    if is_short:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Strike", f"${best.strike:.2f}")
+        c2.metric("Premium received", f"${best.premium_received:.2f}")
+        c3.metric("EV (mechanical)", f"${best.ev:+.2f}")
+        theo_label = "Unbounded" if best.theoretical_max_loss is None else f"${best.theoretical_max_loss:,.2f}"
+        c4.metric("Theoretical max loss", theo_label)
+        if best.theoretical_max_loss is None:
+            st.caption(
+                "Unbounded because a naked short call has no ceiling on the underlying — see warning above. "
+                "EV/sizing use the finite mechanical stop-loss loss instead (see Position sizing below)."
+            )
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Strike", f"${best.strike:.2f}")
+        c2.metric("Premium", f"${best.premium:.2f}")
+        c3.metric("EV", f"${best.ev:+.2f}")
     if best.is_poor_setup:
         st.warning(f"Risk/reward {best.risk_reward:.2f}:1 is below your {config.min_risk_reward_ratio:.1f}:1 minimum — poor setup by this rule, even though it's the best of the candidates.")
+    if is_short:
+        st.caption(
+            "Note: under the DEFAULT config (profit target = 100% of the credit captured, stop-loss = "
+            f"{config.short_stop_loss_multiple:.1f}x the credit received), mechanical risk:reward for a short "
+            "position works out to exactly 1/(short_stop_loss_multiple - 1) = "
+            f"{1.0 / (config.short_stop_loss_multiple - 1.0):.2f}:1 for EVERY strike, regardless of how good or bad "
+            "it actually is — it doesn't discriminate between candidates the way it does on the long side (where "
+            "premium level genuinely changes the ratio). It will read 'Poor' against the shared 2:1 minimum by "
+            "construction whenever short_stop_loss_multiple <= 3.0. Rank short candidates by EV, not by this flag."
+        )
 
-    sizing_result = risk_sizing.size_position(
-        account_size=account_override or 1.0,
-        premium_per_contract=best.premium,
-        p_win=best_p_win,
-        profit_if_win_per_contract=best.profit_if_win,
-        config=config,
-    )
+    st.markdown("##### Recommended trade — payoff")
+    leg_premium = best.premium_received if is_short else best.premium
+    leg_contracts = -1.0 if is_short else 1.0
+    payoff_leg = option_strategy.OptionLeg(option_type=direction, strike=best.strike, premium=leg_premium, contracts=leg_contracts, shares_per_contract=100.0, iv=market_iv)
+    _render_strategy_profile([payoff_leg], ticker, key_suffix="risk_tool", dte=int(dte), live_capable=True)
+
     st.markdown("##### Position sizing")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Kelly fraction used", f"{sizing_result.kelly_fraction_used:.1%}")
-    c2.metric("Kelly-suggested size", f"${sizing_result.kelly_dollar_size:,.0f}")
-    c3.metric("Hard cap (5% default)", f"${sizing_result.hard_cap_dollar_size:,.0f}")
-    c4.metric("Recommended", f"${sizing_result.recommended_dollar_size:,.0f}", f"{sizing_result.recommended_contracts} contracts")
-    if sizing_result.capped_by_hard_limit:
-        st.caption("Capped by the hard %-of-account limit, not by Kelly — the cap always wins.")
+    if governor_result.halted:
+        st.error(
+            "**New entries halted by portfolio governors** — see banner above. No position size is recommended "
+            "while halted; sizing a brand-new trade through an active halt defeats the point of having one."
+        )
+    else:
+        if is_short:
+            sizing_result = risk_sizing.size_short_position(
+                account_size=account_override or 1.0,
+                premium_received_per_contract=best.premium_received,
+                mechanical_max_loss_per_contract=best.mechanical_max_loss,
+                p_win=best_p_win,
+                profit_if_win_per_contract=best.profit_if_win,
+                config=config,
+            )
+        else:
+            sizing_result = risk_sizing.size_position(
+                account_size=account_override or 1.0,
+                premium_per_contract=best.premium,
+                p_win=best_p_win,
+                profit_if_win_per_contract=best.profit_if_win,
+                config=config,
+            )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Kelly fraction used", f"{sizing_result.kelly_fraction_used:.1%}")
+        c2.metric("Kelly-suggested size", f"${sizing_result.kelly_dollar_size:,.0f}")
+        c3.metric("Hard cap (5% default)", f"${sizing_result.hard_cap_dollar_size:,.0f}")
+        c4.metric("Recommended", f"${sizing_result.recommended_dollar_size:,.0f}", f"{sizing_result.recommended_contracts} contracts")
+        if sizing_result.capped_by_hard_limit:
+            st.caption("Capped by the hard %-of-account limit, not by Kelly — the cap always wins.")
+        if is_short:
+            st.caption(
+                "Sized against your MECHANICAL max loss "
+                f"(stop out at {config.short_stop_loss_multiple:.1f}x premium received = ${best.mechanical_max_loss:.2f}/share), "
+                "not the theoretical max loss above — see risk_tool/sizing.py's size_short_position docstring for why "
+                "premium received can't be used as the capital-at-risk denominator."
+            )
 
-    st.markdown("##### Pre-committed entry/exit levels")
-    entry = best.premium
-    c1, c2 = st.columns(2)
-    c1.metric("Profit target", f"${entry * (1 + config.profit_target_pct):.2f}", f"+{config.profit_target_pct:.0%}")
-    c2.metric("Stop loss", f"${entry * (1 + config.stop_loss_pct):.2f}", f"{config.stop_loss_pct:.0%}")
-    st.caption(
-        f"Also exits if |delta| < {config.delta_exit_threshold}, DTE <= {config.theta_exit_dte_threshold} while still OTM, "
-        f"or IV drops >= {config.iv_crush_threshold_points:.0%} points from entry ({market_iv:.1%})."
-    )
+        st.markdown("##### Pre-committed entry/exit levels")
+        if is_short:
+            entry = best.premium_received
+            target_buyback = entry - best.profit_if_win
+            stop_buyback = entry + best.mechanical_max_loss
+            c1, c2 = st.columns(2)
+            c1.metric("Profit-target buy-back price", f"${target_buyback:.2f}", f"capture ${best.profit_if_win:.2f}/share of the ${entry:.2f} credit")
+            c2.metric("Stop-loss buy-back price", f"${stop_buyback:.2f}", f"cap mechanical loss at ${best.mechanical_max_loss:.2f}/share")
+            theo_note = (
+                "unbounded — no buy-back price caps it if you fail to execute the stop"
+                if best.theoretical_max_loss is None
+                else f"${best.theoretical_max_loss:,.2f}/share if the position is never closed"
+            )
+            st.caption(
+                "These are YOUR mechanical rule's levels (risk_tool/config.py's short_stop_loss_multiple), not "
+                "risk_manager.py's %P&L exit rules — those are explicitly long-only (see the Live Position Monitor's "
+                f"skip logic below) and don't yet cover short positions. True theoretical max loss is {theo_note}."
+            )
+        else:
+            entry = best.premium
+            c1, c2 = st.columns(2)
+            c1.metric("Profit target", f"${entry * (1 + config.profit_target_pct):.2f}", f"+{config.profit_target_pct:.0%}")
+            c2.metric("Stop loss", f"${entry * (1 + config.stop_loss_pct):.2f}", f"{config.stop_loss_pct:.0%}")
+            st.caption(
+                f"Also exits if |delta| < {config.delta_exit_threshold}, DTE <= {config.theta_exit_dte_threshold} while still OTM, "
+                f"or IV drops >= {config.iv_crush_threshold_points:.0%} points from entry ({market_iv:.1%})."
+            )
 
 
 def render_position_monitor(d: dict):
@@ -1590,31 +1819,20 @@ def render_position_monitor(d: dict):
     )
 
     st.markdown("###### Portfolio governors")
-    net_delta_dollars = float(positions["delta"].sum())
-    net_vega_dollars = float(positions["vega"].sum())
-    daily_pnl = float(d["overview"].get("day_pl") or 0.0)
-
+    st.caption(
+        "These caps are also what the Risk Tool section above checks before recommending a new position size — "
+        "set them here and they apply there too (shared via GOVERNOR_MAX_DELTA_KEY/GOVERNOR_MAX_VEGA_KEY session state)."
+    )
     c1, c2 = st.columns(2)
-    max_delta_input = c1.number_input("Max net delta ($, 0 = no cap)", min_value=0.0, value=0.0, step=1000.0)
-    max_vega_input = c2.number_input("Max net vega ($, 0 = no cap)", min_value=0.0, value=0.0, step=100.0)
+    c1.number_input("Max net delta ($, 0 = no cap)", min_value=0.0, value=0.0, step=1000.0, key=GOVERNOR_MAX_DELTA_KEY)
+    c2.number_input("Max net vega ($, 0 = no cap)", min_value=0.0, value=0.0, step=100.0, key=GOVERNOR_MAX_VEGA_KEY)
 
-    governor_config = RiskConfig(
-        daily_max_loss_pct=config.daily_max_loss_pct,
-        max_net_delta_dollars=max_delta_input if max_delta_input > 0 else None,
-        max_net_vega_dollars=max_vega_input if max_vega_input > 0 else None,
-    )
-    state = risk_manager.PortfolioState(
-        account_size=float(d["overview"].get("equity") or 1.0),
-        daily_pnl=daily_pnl,
-        net_delta_dollars=net_delta_dollars,
-        net_vega_dollars=net_vega_dollars,
-    )
-    governor_result = risk_manager.check_portfolio_governors(state, governor_config)
+    governor_result, state = _portfolio_governor_result(d, config)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Day P&L", f"${daily_pnl:,.2f}")
-    c2.metric("Net delta ($)", f"{net_delta_dollars:,.0f}")
-    c3.metric("Net vega ($)", f"{net_vega_dollars:,.2f}")
+    c1.metric("Day P&L", f"${state.daily_pnl:,.2f}")
+    c2.metric("Net delta ($)", f"{state.net_delta_dollars:,.0f}")
+    c3.metric("Net vega ($)", f"{state.net_vega_dollars:,.2f}")
     if governor_result.halted:
         st.error("**New entries halted:**")
         for reason in governor_result.reasons:
