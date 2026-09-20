@@ -30,6 +30,8 @@ hidden.
 """
 from __future__ import annotations
 
+import os
+import uuid
 from pathlib import Path
 
 import pandas as pd
@@ -50,34 +52,70 @@ def _history_path(symbol: str, expiration: str) -> Path:
     return HISTORY_DIR / f"{symbol.strip().upper()}_{expiration}.csv"
 
 
+def _read_raw(path: Path) -> pd.DataFrame:
+    """Read defensively -- see log_snapshot's docstring for the concurrent-
+    write race this guards against. A stray duplicate header row mid-file
+    shows up as the literal string "date"/"atm_iv" where real values
+    should be, and that one bad row forces pandas to read the WHOLE
+    atm_iv column as strings (mixed numeric/text can't infer as numeric),
+    not just flag that one row -- so re-coercing only "date" would leave
+    every atm_iv value silently a string. Drop any row that doesn't parse
+    as a real date or a real number, then explicitly re-coerce atm_iv
+    back to float."""
+    if not path.exists():
+        return pd.DataFrame(columns=_HISTORY_COLUMNS)
+    df = pd.read_csv(path)
+    if df.empty:
+        return df
+    parsed_date = pd.to_datetime(df["date"], errors="coerce")
+    bad = parsed_date.isna() | pd.to_numeric(df["atm_iv"], errors="coerce").isna()
+    if bad.any():
+        df = df.loc[~bad].copy()
+        parsed_date = parsed_date.loc[~bad]
+    df["date"] = parsed_date
+    df["atm_iv"] = pd.to_numeric(df["atm_iv"])
+    return df
+
+
 def log_snapshot(symbol: str, expiration: str, atm_iv: float | None, snapshot_date: str | None = None) -> bool:
     """Append today's ATM IV for this (symbol, expiration), unless today's
     date is already logged or atm_iv is None (chain had no usable ATM
-    quote). Returns True if a new snapshot was written."""
+    quote). Returns True if a new snapshot was written.
+
+    Writes via read-everything -> merge -> atomic replace, not CSV append
+    mode -- see oi_history.log_snapshot's docstring (same fix, same reason:
+    concurrent Streamlit Cloud sessions racing the append-mode
+    `header=not path.exists()` check corrupted a live deployment's file)."""
     if atm_iv is None:
         return False
     date_str = snapshot_date or pd.Timestamp.now().strftime("%Y-%m-%d")
 
     path = _history_path(symbol, expiration)
-    if path.exists():
-        existing_dates = pd.read_csv(path, usecols=["date"])["date"].astype(str)
-        if date_str in existing_dates.values:
-            return False
+    existing = _read_raw(path)
+    if not existing.empty and date_str in existing["date"].dt.strftime("%Y-%m-%d").values:
+        return False
 
     snapshot = pd.DataFrame([{"date": date_str, "atm_iv": float(atm_iv)}])
+    if not existing.empty:
+        existing = existing.copy()
+        existing["date"] = existing["date"].dt.strftime("%Y-%m-%d")
+        combined = pd.concat([existing, snapshot], ignore_index=True)
+    else:
+        combined = snapshot
+
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    snapshot.to_csv(path, mode="a", header=not path.exists(), index=False)
+    tmp_path = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
+    combined.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, path)  # atomic on POSIX and Windows
     return True
 
 
 def load_history(symbol: str, expiration: str) -> pd.DataFrame:
     """All logged ATM IV snapshots for this (symbol, expiration), sorted by
     date. Empty DataFrame (same columns, zero rows) if nothing's logged."""
-    path = _history_path(symbol, expiration)
-    if not path.exists():
+    df = _read_raw(_history_path(symbol, expiration))
+    if df.empty:
         return pd.DataFrame(columns=_HISTORY_COLUMNS)
-    df = pd.read_csv(path)
-    df["date"] = pd.to_datetime(df["date"])
     return df.sort_values("date").reset_index(drop=True)
 
 

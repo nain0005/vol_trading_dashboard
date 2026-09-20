@@ -160,3 +160,30 @@ def test_min_observations_threshold_constant_is_reasonable():
     # rank is trustworthy enough to headline -- must require more than the
     # bare minimum (2) the math itself needs to not divide by zero.
     assert iv_history.MIN_OBSERVATIONS_FOR_RANK >= 2
+
+
+def test_load_history_survives_a_stray_duplicate_header_row():
+    # Same real production crash as oi_history's identical test -- see that
+    # test's docstring for the full concurrent-write race explanation.
+    # iv_history.py has the exact same log_snapshot/load_history pattern
+    # and needed the exact same fix.
+    iv_history.log_snapshot("AAPL", "2026-12-18", 0.25, snapshot_date="2026-09-15")
+
+    path = iv_history._history_path("AAPL", "2026-12-18")
+    with open(path, "a") as f:
+        f.write("date,atm_iv\n")  # the stray duplicate header
+
+    history = iv_history.load_history("AAPL", "2026-12-18")  # must not raise
+    assert len(history) == 1
+    assert history.iloc[0]["atm_iv"] == pytest.approx(0.25)
+
+
+def test_log_snapshot_write_is_atomic_not_append_mode():
+    iv_history.log_snapshot("AAPL", "2026-12-18", 0.25, snapshot_date="2026-09-15")
+    iv_history.log_snapshot("AAPL", "2026-12-18", 0.27, snapshot_date="2026-09-16")
+
+    path = iv_history._history_path("AAPL", "2026-12-18")
+    lines = path.read_text().splitlines()
+    header_lines = [ln for ln in lines if ln.startswith("date,atm_iv")]
+    assert len(header_lines) == 1
+    assert len(lines) == 3  # 1 header + 2 data rows
