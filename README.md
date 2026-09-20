@@ -18,22 +18,45 @@ A few things this codebase is meant to show, for anyone skimming it:
   binomial tree, Brent's-method implied vol solving, all independently
   verified against known textbook values and put-call parity
   (`risk_tool/pricing.py`, `risk_tool/greeks.py`).
-- **Real risk management, not just signals** — Kelly-criterion sizing with a
-  hard cap that always wins regardless of what Kelly suggests
+- **Real risk management, not just signals** — Kelly-criterion sizing (long
+  *and* short-premium/credit positions, with the mechanical-stop-loss vs.
+  theoretical-unbounded-loss distinction made explicit for naked short
+  calls) with a hard cap that always wins regardless of what Kelly suggests
   (`risk_tool/sizing.py`), pre-committed exit rules evaluated live against
   open positions (`risk_tool/risk_manager.py`), and portfolio-level delta/vega
-  governors that can halt new entries.
+  governors that actually gate new trade recommendations, not just display a
+  status banner (`risk_tool/risk_manager.py`, wired into the Risk Tool tab).
 - **Statistics applied correctly, not just called** — GARCH/EGARCH vol
-  forecasting fit by maximum likelihood (`risk_tool/realized_vol.py`), a
+  forecasting fit by maximum likelihood (`risk_tool/realized_vol.py`); a
   beta-hedge calculator (`risk_tool/hedge.py`) that separates price-level
-  correlation (inflated by shared trend) from return correlation (the honest
-  co-movement signal), and portfolio-level delta-normal + historical
-  Value-at-Risk with full Black-Scholes stress-test repricing
-  (`risk_tool/portfolio_risk.py`).
+  correlation (inflated by shared trend) from return correlation, plus a
+  rolling-window beta-stability check; portfolio-level delta-normal +
+  historical Value-at-Risk with full Black-Scholes stress-test repricing
+  (`risk_tool/portfolio_risk.py`); Student-t vs. normal distribution fitting
+  compared by **AIC, not raw fit error** — a Student-t nests the normal and
+  will always match-or-beat it on unpenalized error, so the model comparison
+  has to penalize the extra parameter or "fat tails win" becomes a foregone
+  conclusion rather than a real finding (`risk_tool/sigma_moves.py`,
+  `risk_tool/oi_distribution.py`); and an empirical, non-parametric check of
+  whether "hasn't moved N-sigma in a while" is actually predictive for a
+  given stock, benchmarked against the pure-chance memoryless baseline
+  rather than assumed (`risk_tool/sigma_moves.py`).
+- **Real arbitrage pricing, with the caveats that make it honest** —
+  put-call parity priced off actual bid/ask (not mid) to size conversions
+  and reversals, with the American-exercise/dividend/borrow-cost reasons
+  this isn't textbook riskless arbitrage for real equity options stated
+  explicitly rather than implied away (`risk_tool/parity_arbitrage.py`).
+- **A real combinatorial optimizer, not a greedy heuristic** — exact 0/1
+  knapsack via dynamic programming (adaptive discretization of the capital
+  and risk-budget axes) to pick the best *combination* of option spread
+  candidates under a budget, independently verified against brute-force
+  search on cases where the greedy-by-ratio pick is provably wrong
+  (`risk_tool/spread_portfolio.py`).
 - **Test discipline** — the entire `risk_tool/` package is pure, dependency-injected,
-  and independently pytest-covered (237 passing cases: `pytest tests/ -v`) —
-  it's also usable as a standalone CLI with no Streamlit/Robinhood dependency
-  at all (`python3 -m risk_tool.cli --help`).
+  and independently pytest-covered (373 passing cases: `pytest tests/ -v`),
+  with a house style of hand-verified or independently-recomputed expected
+  values rather than "doesn't crash" — it's also usable as a standalone CLI
+  with no Streamlit/Robinhood dependency at all (`python3 -m risk_tool.cli --help`).
 - **Production-adjacent app structure** — Robinhood I/O is fully isolated from
   presentation (`app/data_fetch.py` returns plain DataFrames, `dashboard.py` is
   UI-only), so the business logic is testable without a live session or network
@@ -62,22 +85,42 @@ A few things this codebase is meant to show, for anyone skimming it:
   recurrence estimate and a fitted Student-t tail model — with an explicit
   methodology note on why "overdue" alone isn't a forecast.
 - **Vol Skew** — live IV-by-strike and bid/ask-spread-by-strike for any
-  underlying/expiration (with your held contracts marked on both charts), a
+  underlying/expiration (with your held contracts marked on every chart), a
   term-structure view (ATM IV across expirations vs. trailing 20d/60d
-  realized vol), a full 3D volatility surface (strike × expiration × IV,
-  OTM-stitched and interpolated onto a shared strike grid), open
-  interest × volume and day-over-day OI change by strike, and a 3D open
-  interest surface (strike × date) built from a local snapshot log since
-  Robinhood exposes no OI history endpoint.
-- **Risk Tool** — strike selection by expected value, Kelly-based position
-  sizing with a non-overridable hard cap, pre-committed entry/exit levels,
-  and a live monitor that runs exit rules against your actual open
-  positions. Does not predict direction — see `risk_tool/README.md` for the
-  full model-by-model writeup (math, assumptions, limitations). Also usable
+  realized vol), IV Rank/Percentile against a locally-logged IV history
+  (Robinhood exposes no IV history endpoint, so this starts at "not enough
+  data yet" honestly rather than faking a number), a full 3D volatility
+  surface (strike × expiration × IV, OTM-stitched and interpolated onto a
+  shared strike grid), open interest × volume and day-over-day OI change by
+  strike, a 3D open interest surface (strike × date) built from a local
+  snapshot log, **normal-vs-Student-t distribution fitting to open interest
+  by strike** (AIC-compared, with an explicit "OI concentration ≠
+  institutional intent" caveat) alongside a real, separately-computed
+  **max pain** strike, and **put-call parity arbitrage pricing** (conversion/
+  reversal edges off actual bid/ask, with the American-exercise/dividend/
+  borrow-cost reasons this isn't textbook riskless arbitrage stated
+  up front).
+- **Risk Tool** — strike selection by expected value for long calls/puts
+  *and* short premium (cash-secured puts, naked calls — with max loss shown
+  as mechanical-stop-loss vs. theoretical-unbounded, not conflated), Kelly-
+  based position sizing with a non-overridable hard cap, a payoff chart for
+  the recommended trade, an earnings-date check against the chosen DTE
+  window, and portfolio governors (daily loss halt, net delta/vega caps)
+  that actually block a new size recommendation when breached, not just
+  display a status badge next to it. Does not predict direction — see
+  `risk_tool/README.md` for the full model-by-model writeup. Also usable
   standalone: `python3 -m risk_tool.cli --help`.
-- **Spread Selector** — ranks real, listed strikes for bear put spreads, bull
-  put spreads, straddles, and strangles against your own realized/GARCH/
-  EGARCH vol view (edge EV), not just risk:reward.
+- **Spread Selector** — ranks real, listed strikes across 8 strategies (both
+  vertical spread directions, straddle, strangle, iron condor, iron
+  butterfly) against your own realized/GARCH/EGARCH vol view (edge EV), not
+  just risk:reward, with a side-by-side comparison across all 8 at once and
+  an alternative strike-search mode that places strikes at percentiles of
+  the open-interest distribution fit instead of a flat dollar increment.
+- **Portfolio Optimizer** — given a capital (and optional risk) budget,
+  picks the best *combination* of spread candidates across tickers and
+  strategies — exact 0/1 knapsack DP, not a greedy per-ticker ranking, so it
+  can correctly pick a combination that beats the individually-highest-edge
+  candidates when the budget doesn't fit all of them.
 - **Strategy Payoff** — exact max profit/loss/breakeven(s) for any multi-leg
   combination of calls/puts you build by hand, plus a live mark-to-market
   curve.
@@ -86,17 +129,28 @@ A few things this codebase is meant to show, for anyone skimming it:
   sensitivity curves, and an earnings/IV-crush simulator for any structure —
   build one from scratch, import an open position, or send one over from the
   Spread Selector or Strategy Payoff tabs.
-- **Delta Hedge** — sizes a beta-hedge (shares or futures) for a shares or
-  options position against any correlated instrument, with beta estimated
-  live from price history, plus a movable P&L scenario chart (drag to any
-  bearish or bullish move) for the resulting hedged position.
+- **Delta Hedge** — two distinct modes, not conflated: a classic
+  same-underlying delta-neutral hedge (net delta across multiple legs on one
+  underlying, with a gamma-aware rebalancing curve showing how the hedge
+  decays as spot moves) and a cross-asset beta-hedge against any correlated
+  instrument, with a rolling-window beta-stability check and a movable P&L
+  scenario chart for the hedged position either way.
+- **Sigma Screener** — ranks tickers by how overdue they are for a 2σ/3σ
+  move relative to their own trailing realized vol (empirical recurrence
+  *and* a fitted Student-t tail model), plus an empirical 1σ crash-
+  probability check: given a stock has already gone N days without a move,
+  what fraction of its own history saw one within the next few days,
+  benchmarked against the pure-chance memoryless baseline rather than
+  assuming "overdue" means anything.
 - **Orders & History** — open orders and recent fills.
 - **Win Rate** — realized round-trip trades FIFO-matched from your fill history (matched per exact
   option contract, not just underlying symbol, so two different contracts on the same underlying
   held at once can't cross-match), with win rate, avg win/loss, profit factor, a cumulative
   realized-P&L chart, and a breakdown by equity vs. options.
-- **Journal / Export** — normalized trade log with a CSV download button
-  (and an option to save a timestamped copy into `exports/`).
+- **Journal / Export** — trade log with freeform per-trade tags and notes
+  (locally stored, searchable/filterable by tag or text), a CSV download
+  button that includes them, and an option to save a timestamped copy into
+  `exports/`.
 
 ## Setup
 

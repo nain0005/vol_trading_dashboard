@@ -125,6 +125,14 @@ actually exiting at your stated target. Half-Kelly and the hard cap both
 exist specifically to blunt the damage when that assumption is wrong,
 which is most of the time.
 
+**Short premium** (`size_short_position`) sizes credit trades against the
+**mechanical stop-loss** (a real, finite dollar number your own exit rule
+defines) — never against the theoretical max loss, which is unbounded for
+a naked short call and would make Kelly's denominator undefined. The
+distinction between "mechanical" (what sizing actually uses) and
+"theoretical" (what you could really lose if you never exit) is surfaced
+explicitly in the Risk Tool tab, not smoothed over.
+
 ### 4. Risk manager — exit rules (`risk_manager.py`)
 
 Five mechanical, pre-committed rules, each returning **why** it fired with
@@ -141,7 +149,10 @@ the actual numbers, not just a boolean:
 Plus portfolio-level governors (`check_portfolio_governors`): a **daily
 max-loss halt** on new entries (default 3% of account) and optional net
 delta/vega dollar caps (unset by default — there's no universal correct
-value, set them to what your account can actually tolerate).
+value, set them to what your account can actually tolerate). The Risk Tool
+tab checks this same governor state before recommending a NEW position
+size — a halted account gets a blocked-recommendation banner, not a
+confident Kelly size sitting next to a "halted" badge it never looked at.
 
 **Known limitation, dashboard-specific**: the dashboard doesn't persist a
 trade log, so "entry IV" for the IV-crush rule is approximated as
@@ -200,6 +211,85 @@ Black-Scholes at a shocked spot/IV (`option_leg_stress_pl`) rather than
 linearizing — the one place here that captures gamma/vega convexity for a
 large move. See the dashboard's **Portfolio Risk** tab, or the module
 docstring for the full tradeoffs between the two VaR methods.
+
+### 7. Multi-leg spread selection (`spread_selection.py`)
+
+Extends strike_selection.py's single-leg EV idea to 8 defined-structure
+strategies (both vertical spread directions, straddle, strangle, iron
+condor, iron butterfly) — every candidate built from strikes actually
+listed in the chain, each leg priced at its own market IV, payoff exact
+via `option_strategy.py` (not reimplemented). `find_best_spreads` also
+takes `strike_source="oi_percentile"` to search strikes at percentiles of
+an open-interest distribution fit (`oi_distribution.py`) instead of a flat
+dollar window, and `compare_strategies` ranks the single best candidate
+across all 8 strategies at once. See the dashboard's **Spread Selector**
+tab.
+
+### 8. Options Lab (`options_lab.py`)
+
+Scenario analysis on top of any leg combination: a full P&L surface across
+spot × days-forward (not just at expiration), aggregate Greeks across a
+spot range, and shock scenarios (a live what-if slider or a discrete
+earnings/IV-crush event) — all built on `option_strategy.strategy_pl_today`
+and `greeks.py`, no new pricing math. See the dashboard's **Options Lab**
+tab.
+
+### 9. Beta-hedge sizing (`hedge.py`)
+
+Two distinct things, not conflated: a classic same-underlying delta-neutral
+hedge (`same_underlying_hedge_shares` — net delta to zero with shares of
+the same stock, no beta needed) and a cross-asset beta-hedge against any
+correlated instrument (`estimate_beta`/`size_hedge`, return-correlation
+not price-correlation, since price-level correlation is inflated by any
+shared trend). `beta_across_windows` checks whether a hedge's beta is
+actually stable across lookback windows before you trust its size. See the
+dashboard's **Delta Hedge** tab.
+
+### 10. Sigma-move statistics (`sigma_moves.py`)
+
+Two honest questions about a stock's own history, not one collapsed into
+the other: how often has it actually moved 2σ/3σ+ (empirical recurrence
+*and* a Student-t tail fit, compared by AIC — see below), and — given it's
+*already* gone N days without a move — what's the empirical (not assumed)
+probability of one soon, benchmarked against the pure-chance memoryless
+baseline. The module docstring is explicit that "overdue" alone is the
+gambler's fallacy unless the empirical number actually clears the
+baseline. See the dashboard's **Sigma Screener** tab.
+
+### 11. Open-interest distribution fitting (`oi_distribution.py`)
+
+Fits normal and Student-t curves to open interest BY STRIKE — a map of
+where positioning sits, not a forecast, and explicitly not evidence of
+"institutional" activity (retail round-number clustering and market-maker
+hedging flow look identical in this number). Model comparison uses AIC,
+not raw fit error, because Student-t nests the normal and will always
+match-or-beat it unpenalized — a huge fitted degrees-of-freedom on a
+"t wins" result means the data is practically normal regardless of the
+label. Also computes `max_pain` (the strike minimizing total option-writer
+payout), a separate, specific, real calculation that this module is
+careful not to conflate with the distribution fit above. See the
+dashboard's **Vol Skew** tab.
+
+### 12. Put-call parity arbitrage (`parity_arbitrage.py`)
+
+Conversion/reversal edges priced off REAL bid/ask (not mid) when a strike's
+call IV and put IV diverge more than the spread explains — a genuine
+no-arbitrage relationship, true independent of any pricing model. The
+module docstring is explicit about why this isn't textbook riskless
+arbitrage for real (American-style) equity options: early-exercise risk on
+the short leg, real stock-borrow cost for a reversal, and dividend-forecast
+risk. See the dashboard's **Vol Skew** tab.
+
+### 13. Spread portfolio optimization (`spread_portfolio.py`)
+
+Given a list of spread candidates (cost, edge, max loss) and a capital
+budget (and optional risk-budget cap), picks the best *combination* — exact
+0/1 knapsack via dynamic programming over an adaptively-discretized budget
+axis, not a greedy per-candidate ranking, so it can correctly select a
+combination that beats picking candidates in edge-per-dollar order when the
+budget doesn't fit everything. Verified against brute-force search on
+cases constructed so the greedy pick is provably suboptimal. See the
+dashboard's **Portfolio Optimizer** tab.
 
 ## Architecture notes
 
